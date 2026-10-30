@@ -50,6 +50,16 @@ def test_event_retention_default_and_override(tmp_path: Path) -> None:
     assert WorkerConfig.load(path).event_retention_days == 7
 
 
+def test_plugin_memory_limit_default_and_override(tmp_path: Path) -> None:
+    config = create_config(data_dir=tmp_path / "data")
+    assert config.plugin_memory_limit_mb == 512
+    path = tmp_path / "worker.toml"
+    text = config.save(path).read_text(encoding="utf-8")
+    text = text.replace("memory_limit_mb = 512", "memory_limit_mb = 256")
+    path.write_text(text, encoding="utf-8")
+    assert WorkerConfig.load(path).plugin_memory_limit_mb == 256
+
+
 def test_invalid_token_rejected(tmp_path: Path) -> None:
     with pytest.raises(ConfigError):
         WorkerConfig(data_dir=tmp_path, token="short")

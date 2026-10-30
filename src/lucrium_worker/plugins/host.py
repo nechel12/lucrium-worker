@@ -75,6 +75,7 @@ class PluginHost:
         sessions: SessionManager,
         storage: Storage,
         logs: LogBuffer,
+        memory_limit_bytes: int = 512 * 1024 * 1024,
         on_error: ErrorCallback | None = None,
         on_change: ChangeCallback | None = None,
     ) -> None:
@@ -83,6 +84,7 @@ class PluginHost:
         self._sessions = sessions
         self._storage = storage
         self._logs = logs
+        self.memory_limit_bytes = memory_limit_bytes
         self._on_error = on_error
         self._on_change = on_change
         self._processes: dict[str, _PluginProcess] = {}
@@ -236,6 +238,10 @@ class _PluginProcess:
         env = os.environ.copy()
         env[PLUGIN_DIR_ENV] = str(self.directory)
         env[PLUGIN_SOCKET_ENV] = str(self.socket_path)
+        subprocess_kwargs: dict[str, Any] = {}
+        if sys.platform != "win32":
+            # RLIMIT_AS: плагин не должен съесть память VPS (спека §6.3)
+            subprocess_kwargs["preexec_fn"] = _memory_limiter(self.host.memory_limit_bytes)
         try:
             self._process = await asyncio.create_subprocess_exec(
                 sys.executable,
@@ -245,6 +251,7 @@ class _PluginProcess:
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **subprocess_kwargs,
             )
             self._tasks = [
                 asyncio.create_task(self._pump_output(self._process.stdout, "stdout"), name="plugin-stdout"),
@@ -432,6 +439,17 @@ class _PluginProcess:
 
 def _rpc_error(code: int, message: str) -> RpcError:
     return RpcError(code=code, message=message)
+
+
+def _memory_limiter(limit_bytes: int) -> Callable[[], None]:
+    """``preexec_fn``: жёсткий лимит виртуальной памяти процесса плагина."""
+
+    def _limit() -> None:
+        import resource
+
+        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+
+    return _limit
 
 
 def _http_request_sync(params: HttpRequestParams) -> HttpResponseResult:

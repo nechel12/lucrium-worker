@@ -43,7 +43,13 @@ keyfile = "/etc/lucrium/tls/key.pem"
 
 [heartbeat]
 seconds = 15
+
+[plugins]
+memory_limit_mb = 512       # RLIMIT_AS для процесса плагина
 ```
+
+Журнал воркера и плагинов дублируется в `data_dir/logs/worker.log` (JSON-строки)
+и в journald.
 
 ## Что внутри
 

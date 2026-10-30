@@ -52,6 +52,7 @@ class WorkerConfig:
     heartbeat_seconds: float = 15.0
     log_level: str = "info"
     event_retention_days: int = 30
+    plugin_memory_limit_mb: int = 512
     extra: dict[str, object] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
@@ -63,6 +64,8 @@ class WorkerConfig:
             raise ConfigError("heartbeat.seconds must be positive")
         if self.event_retention_days <= 0:
             raise ConfigError("storage.event_retention_days must be positive")
+        if self.plugin_memory_limit_mb <= 0:
+            raise ConfigError("plugins.memory_limit_mb must be positive")
 
     @property
     def database_path(self) -> Path:
@@ -100,6 +103,7 @@ class WorkerConfig:
         worker = _table(raw, "worker")
         storage = _table(raw, "storage")
         heartbeat = _table(raw, "heartbeat")
+        plugins = _table(raw, "plugins")
         tls_raw = raw.get("tls")
 
         data_dir = Path(os.environ.get("LUCRIUM_DATA_DIR", str(storage.get("data_dir", DEFAULT_DATA_DIR))))
@@ -122,6 +126,7 @@ class WorkerConfig:
                 heartbeat_seconds=_as_float(heartbeat.get("seconds", 15.0), "heartbeat.seconds"),
                 log_level=str(worker.get("log_level", "info")),
                 event_retention_days=_as_int(storage.get("event_retention_days", 30), "storage.event_retention_days"),
+                plugin_memory_limit_mb=_as_int(plugins.get("memory_limit_mb", 512), "plugins.memory_limit_mb"),
             )
         except (TypeError, ValueError) as exc:
             raise ConfigError(f"invalid config values in {file}: {exc}") from exc
@@ -143,6 +148,9 @@ class WorkerConfig:
             "",
             "[heartbeat]",
             f"seconds = {self.heartbeat_seconds}",
+            "",
+            "[plugins]",
+            f"memory_limit_mb = {self.plugin_memory_limit_mb}",
         ]
         if self.tls is not None:
             lines += [

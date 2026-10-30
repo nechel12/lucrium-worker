@@ -108,6 +108,7 @@ class WorkerApp:
             logs=self.logs,
             on_error=self._on_plugin_error,
             on_change=self._touch,
+            memory_limit_bytes=self.config.plugin_memory_limit_mb * 1024 * 1024,
         )
         self.connected_panels = 0
         self._started_at = datetime.now(UTC)
@@ -138,6 +139,7 @@ class WorkerApp:
         ensure_directories(self.config)
         await self.storage.open()
         self.logs.set_listener(self._on_log_entry)
+        self.logs.set_file(self.config.logs_dir / "worker.log")
         await self._restore_plugins()
         await self._restore_sessions()
         await self._purge_events()
@@ -169,6 +171,7 @@ class WorkerApp:
         await self.plugins.stop_all()
         await self.sessions.stop_all()
         await self.storage.close()
+        self.logs.close_file()
         self._shutdown.set()
 
     async def wait_closed(self) -> None:
