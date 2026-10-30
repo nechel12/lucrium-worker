@@ -1,0 +1,21 @@
+name: Verify release tag
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify SSH-signed tag
+        run: |
+          git -c gpg.ssh.allowedSignersFile="$GITHUB_WORKSPACE/security/allowed_signers" verify-tag "$GITHUB_REF_NAME"
