@@ -40,6 +40,16 @@ def test_tls_roundtrip(tmp_path: Path) -> None:
     assert loaded.tls == tls
 
 
+def test_event_retention_default_and_override(tmp_path: Path) -> None:
+    config = create_config(data_dir=tmp_path / "data")
+    assert config.event_retention_days == 30
+    path = tmp_path / "worker.toml"
+    text = config.save(path).read_text(encoding="utf-8")
+    text = text.replace("event_retention_days = 30", "event_retention_days = 7")
+    path.write_text(text, encoding="utf-8")
+    assert WorkerConfig.load(path).event_retention_days == 7
+
+
 def test_invalid_token_rejected(tmp_path: Path) -> None:
     with pytest.raises(ConfigError):
         WorkerConfig(data_dir=tmp_path, token="short")

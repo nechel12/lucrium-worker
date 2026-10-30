@@ -17,7 +17,7 @@ from typing import Any
 
 import aiosqlite
 from cryptography.fernet import Fernet, InvalidToken
-from lucrium_protocol import AccountCredentials, Platform, PluginSource, ProxyConfig, to_wire
+from lucrium_protocol import AccountCredentials, EventKind, HubEvent, Platform, PluginSource, ProxyConfig, to_wire
 
 SCHEMA_VERSION = 1
 
@@ -86,6 +86,15 @@ CREATE TABLE IF NOT EXISTS plugin_kv (
     value_json TEXT NOT NULL,
     PRIMARY KEY (plugin_id, key)
 );
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, id);
 """
 
 
@@ -301,6 +310,54 @@ class Storage:
             "SELECT key, value_json FROM plugin_kv WHERE plugin_id = ? ORDER BY key", (plugin_id,)
         )
         return [(row["key"], json.loads(row["value_json"])) for row in await cursor.fetchall()]
+
+    # --- история событий ------------------------------------------------------
+
+    async def add_event(self, event: HubEvent) -> int:
+        cursor = await self.db.execute(
+            "INSERT INTO events (ts, platform, session_id, kind, payload_json) VALUES (?, ?, ?, ?, ?)",
+            (
+                _iso(event.ts),
+                event.platform.value,
+                event.session_id,
+                event.kind.value,
+                event.model_dump_json(),
+            ),
+        )
+        await self.db.commit()
+        return int(cursor.lastrowid or 0)
+
+    async def list_events(
+        self,
+        *,
+        session_id: str | None = None,
+        kind: EventKind | None = None,
+        limit: int = 100,
+        cursor: int | None = None,
+    ) -> tuple[list[HubEvent], int | None]:
+        query = "SELECT id, payload_json FROM events WHERE 1=1"
+        args: list[Any] = []
+        if session_id is not None:
+            query += " AND session_id = ?"
+            args.append(session_id)
+        if kind is not None:
+            query += " AND kind = ?"
+            args.append(kind.value)
+        if cursor is not None:
+            query += " AND id > ?"
+            args.append(cursor)
+        query += " ORDER BY id LIMIT ?"
+        args.append(limit)
+        cursor_obj = await self.db.execute(query, args)
+        rows = list(await cursor_obj.fetchall())
+        events = [HubEvent.model_validate_json(row["payload_json"]) for row in rows]
+        next_cursor = int(rows[-1]["id"]) if len(rows) == limit else None
+        return events, next_cursor
+
+    async def purge_events(self, before: datetime) -> int:
+        cursor = await self.db.execute("DELETE FROM events WHERE ts < ?", (_iso(before),))
+        await self.db.commit()
+        return cursor.rowcount
 
     async def clear_all(self) -> None:
         """Очищает аккаунты/плагины/KV (режим ``import_state`` = replace)."""

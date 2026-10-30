@@ -612,7 +612,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aiosellers-nechel12", specifier = ">=0.3.2,<0.4" },
+    { name = "aiosellers-nechel12", specifier = "==0.3.2" },
     { name = "aiosqlite", specifier = ">=0.20" },
     { name = "cryptography", specifier = ">=43" },
     { name = "jsonschema", specifier = ">=4.23" },

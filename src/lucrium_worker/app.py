@@ -13,7 +13,7 @@ import hashlib
 import platform as platform_module
 import sys
 from collections.abc import Awaitable, Callable, Coroutine
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,8 @@ from lucrium_protocol import (
     ErrorCode,
     Event,
     ExportStateParams,
+    GetEventsParams,
+    GetEventsResult,
     GetLogsParams,
     GetLogsResult,
     GetPluginSchemaParams,
@@ -113,6 +115,7 @@ class WorkerApp:
         self._token = config.token
         self._broadcaster: Broadcaster | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._retention_task: asyncio.Task[None] | None = None
         self._state_task: asyncio.Task[None] | None = None
         self._background: set[asyncio.Task[None]] = set()
         self._shutdown = asyncio.Event()
@@ -137,7 +140,9 @@ class WorkerApp:
         self.logs.set_listener(self._on_log_entry)
         await self._restore_plugins()
         await self._restore_sessions()
+        await self._purge_events()
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="worker-heartbeat")
+        self._retention_task = asyncio.create_task(self._retention_loop(), name="worker-retention")
         self.logs.add(LogLevel.INFO, "worker", f"worker {__version__} started", {"data_dir": str(self.config.data_dir)})
         self._touch()
 
@@ -149,6 +154,10 @@ class WorkerApp:
             self._heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._heartbeat_task
+        if self._retention_task is not None:
+            self._retention_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._retention_task
         if self._state_task is not None:
             self._state_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -244,6 +253,9 @@ class WorkerApp:
         if method == Command.GET_LOGS:
             assert isinstance(payload, GetLogsParams)
             return self._get_logs(payload)
+        if method == Command.GET_EVENTS:
+            assert isinstance(payload, GetEventsParams)
+            return await self._get_events(payload)
         if method == Command.ROTATE_TOKEN:
             assert isinstance(payload, RotateTokenParams)
             return self._rotate_token()
@@ -535,6 +547,10 @@ class WorkerApp:
     # --- события --------------------------------------------------------------
 
     async def _on_hub_event(self, event: Any) -> None:
+        try:
+            await self.storage.add_event(event)
+        except Exception as exc:
+            self.logs.add(LogLevel.ERROR, "worker", f"cannot persist event: {exc}")
         await self.broadcast(build_event(ServerEvent.HUB, event))
         await self.plugins.dispatch(event)
 
@@ -584,6 +600,21 @@ class WorkerApp:
             status = self.worker_status(accounts=accounts, plugins=plugins)
             await self.broadcast(build_event(ServerEvent.STATUS, status))
 
+    async def _retention_loop(self) -> None:
+        while True:
+            await asyncio.sleep(24 * 3600)
+            await self._purge_events()
+
+    async def _purge_events(self) -> None:
+        before = datetime.now(UTC) - timedelta(days=self.config.event_retention_days)
+        try:
+            removed = await self.storage.purge_events(before)
+        except Exception as exc:
+            self.logs.add(LogLevel.WARNING, "worker", f"event retention failed: {exc}")
+            return
+        if removed:
+            self.logs.add(LogLevel.INFO, "worker", f"event retention removed {removed} records")
+
     # --- прочее ---------------------------------------------------------------
 
     def _get_logs(self, payload: GetLogsParams) -> GetLogsResult:
@@ -595,6 +626,15 @@ class WorkerApp:
             cursor=payload.cursor,
         )
         return GetLogsResult(entries=entries, next_cursor=next_cursor)
+
+    async def _get_events(self, payload: GetEventsParams) -> GetEventsResult:
+        events, next_cursor = await self.storage.list_events(
+            session_id=payload.session_id,
+            kind=payload.kind,
+            limit=payload.limit,
+            cursor=payload.cursor,
+        )
+        return GetEventsResult(events=events, next_cursor=next_cursor)
 
     def _rotate_token(self) -> RotateTokenResult:
         from .config import generate_token

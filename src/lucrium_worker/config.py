@@ -51,6 +51,7 @@ class WorkerConfig:
     tls: TlsConfig | None = None
     heartbeat_seconds: float = 15.0
     log_level: str = "info"
+    event_retention_days: int = 30
     extra: dict[str, object] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
@@ -60,6 +61,8 @@ class WorkerConfig:
             raise ConfigError("pairing token must be at least 32 characters (128+ bits)")
         if self.heartbeat_seconds <= 0:
             raise ConfigError("heartbeat.seconds must be positive")
+        if self.event_retention_days <= 0:
+            raise ConfigError("storage.event_retention_days must be positive")
 
     @property
     def database_path(self) -> Path:
@@ -118,6 +121,7 @@ class WorkerConfig:
                 tls=tls,
                 heartbeat_seconds=_as_float(heartbeat.get("seconds", 15.0), "heartbeat.seconds"),
                 log_level=str(worker.get("log_level", "info")),
+                event_retention_days=_as_int(storage.get("event_retention_days", 30), "storage.event_retention_days"),
             )
         except (TypeError, ValueError) as exc:
             raise ConfigError(f"invalid config values in {file}: {exc}") from exc
@@ -135,6 +139,7 @@ class WorkerConfig:
             "",
             "[storage]",
             f'data_dir = "{self.data_dir.as_posix()}"',
+            f"event_retention_days = {self.event_retention_days}",
             "",
             "[heartbeat]",
             f"seconds = {self.heartbeat_seconds}",

@@ -130,6 +130,25 @@ async def test_get_plugin_schema(app: WorkerApp) -> None:
     assert result.config == {}
 
 
+async def test_get_events_history(app: WorkerApp) -> None:
+    from datetime import UTC, datetime
+
+    from lucrium_protocol import EventKind, GetEventsParams, HubEvent, Platform
+
+    await app.storage.add_event(
+        HubEvent(
+            platform=Platform.FUNPAY,
+            session_id="acc-1",
+            kind=EventKind.MESSAGE,
+            payload={"message": {"text": "hi"}},
+            ts=datetime.now(UTC),
+        )
+    )
+    result = _result(app, await _call(app, Command.GET_EVENTS, GetEventsParams()), Command.GET_EVENTS)
+    assert len(result.events) == 1
+    assert result.events[0].payload["message"]["text"] == "hi"
+
+
 async def test_call_client(app: WorkerApp) -> None:
     add = AddAccountParams.model_validate(
         {

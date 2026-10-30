@@ -80,6 +80,41 @@ async def test_plugin_crud_and_kv(storage: Storage, tmp_path: Path) -> None:
     assert await storage.kv_keys("test-plugin") == []
 
 
+async def test_event_history_and_retention(storage: Storage) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from lucrium_protocol import EventKind, HubEvent, Platform
+
+    now = datetime.now(UTC)
+    await storage.add_event(
+        HubEvent(platform=Platform.FUNPAY, session_id="acc-1", kind=EventKind.MESSAGE, payload={"n": 1}, ts=now)
+    )
+    await storage.add_event(
+        HubEvent(
+            platform=Platform.GGSEL,
+            session_id="acc-2",
+            kind=EventKind.ORDER,
+            payload={"n": 2},
+            ts=now - timedelta(days=40),
+        )
+    )
+
+    events, _ = await storage.list_events(session_id="acc-1")
+    assert [event.payload["n"] for event in events] == [1]
+    events, _ = await storage.list_events(kind=EventKind.ORDER)
+    assert [event.payload["n"] for event in events] == [2]
+
+    first, cursor = await storage.list_events(limit=1)
+    assert len(first) == 1 and cursor is not None
+    rest, _ = await storage.list_events(limit=10, cursor=cursor)
+    assert len(rest) == 1
+
+    removed = await storage.purge_events(now - timedelta(days=30))
+    assert removed == 1
+    remaining, _ = await storage.list_events()
+    assert [event.payload["n"] for event in remaining] == [1]
+
+
 async def test_wrong_secret_key_fails_loudly(tmp_path: Path) -> None:
     db = tmp_path / "lucrium.db"
     first = Storage(db, tmp_path / "secret.key")

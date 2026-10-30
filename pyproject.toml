@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 license = "AGPL-3.0-only"
 authors = [{ name = "nechel12" }]
 dependencies = [
-    "aiosellers-nechel12>=0.3.2,<0.4",
+    "aiosellers-nechel12==0.3.2",
     "aiosqlite>=0.20",
     "cryptography>=43",
     "jsonschema>=4.23",
