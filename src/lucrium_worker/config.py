@@ -69,6 +69,8 @@ class WorkerConfig:
             raise ConfigError("storage.event_retention_days must be positive")
         if self.plugin_memory_limit_mb <= 0:
             raise ConfigError("plugins.memory_limit_mb must be positive")
+        if not isinstance(self.plugin_sandbox, bool):
+            raise ConfigError("plugins.sandbox must be a boolean")
 
     @property
     def database_path(self) -> Path:
