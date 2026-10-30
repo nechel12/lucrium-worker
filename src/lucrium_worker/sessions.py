@@ -39,6 +39,25 @@ BACKOFF_MAX = 30.0
 EventHandler = Callable[[HubEvent], Awaitable[None]]
 
 
+ALLOWED_CLIENT_ROOTS = frozenset(
+    {
+        "account",
+        "categories",
+        "chats",
+        "deals",
+        "finance",
+        "games",
+        "items",
+        "lots",
+        "orders",
+        "products",
+        "reviews",
+        "sales",
+        "transactions",
+    }
+)
+
+
 class SessionError(Exception):
     """Сессия не найдена/не запущена или вызов невозможен."""
 
@@ -129,6 +148,9 @@ class SessionManager:
 
     async def call(self, session_id: str | None, method: str, params: dict[str, Any]) -> Any:
         """Вызов метода клиента aiosellers через dotted-путь (``chats.send_message``)."""
+        root = method.split(".", 1)[0]
+        if root not in ALLOWED_CLIENT_ROOTS:
+            raise SessionError(f"method {method!r} is not allowed")
         runtime = self.resolve(session_id)
         target: Any = runtime.client
         for part in method.split("."):
@@ -146,6 +168,9 @@ class SessionManager:
         runtime = self._runtimes.get(record.id)
         if runtime is not None and runtime.status in {SessionStatus.RUNNING, SessionStatus.STARTING}:
             return runtime
+        if runtime is not None:
+            # ERROR/STOPPED: сначала гасим прежнюю задачу, чтобы не было двух сессий
+            await self.stop(record.id)
         runtime = SessionRuntime(account_id=record.id, platform=record.platform)
         self._runtimes[record.id] = runtime
         runtime.task = asyncio.create_task(self._supervise(record, runtime), name=f"session-{record.id}")
@@ -179,6 +204,7 @@ class SessionManager:
             hub = SellerHub()
             try:
                 client = build_client(record, state)
+                runtime.client = client
                 hub.add(client, platform=record.platform.value, session_id=record.id)
                 await hub.start()
                 runtime.status = SessionStatus.RUNNING
@@ -203,6 +229,7 @@ class SessionManager:
                     {"platform": record.platform.value, "restart_in": backoff},
                 )
             finally:
+                runtime.client = None
                 with contextlib.suppress(Exception):
                     await hub.close()
                 with contextlib.suppress(Exception):
@@ -215,6 +242,7 @@ class SessionManager:
 
 
 __all__ = [
+    "ALLOWED_CLIENT_ROOTS",
     "BACKOFF_MAX",
     "BACKOFF_START",
     "SessionError",
