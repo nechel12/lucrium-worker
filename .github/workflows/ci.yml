@@ -20,6 +20,7 @@ jobs:
         with:
           repository: nechel12/lucrium-protocol
           path: lucrium-protocol
+          ssh-key: ${{ secrets.PROTOCOL_DEPLOY_KEY }}
 
       - name: Checkout worker
         uses: actions/checkout@v4
