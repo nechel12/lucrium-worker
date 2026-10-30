@@ -56,6 +56,7 @@ async def test_plugin_subprocess_lifecycle(tmp_path: Path) -> None:
         sessions=sessions,  # type: ignore[arg-type]
         storage=storage,
         logs=logs,
+        sandbox=False,
     )
     try:
         await host.start(record)

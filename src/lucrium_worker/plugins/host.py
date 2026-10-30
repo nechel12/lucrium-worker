@@ -8,6 +8,8 @@ import contextlib
 import inspect
 import json
 import os
+import shutil
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -81,6 +83,9 @@ class PluginHost:
         memory_limit_bytes: int = 512 * 1024 * 1024,
         on_error: ErrorCallback | None = None,
         on_change: ChangeCallback | None = None,
+        sandbox: bool = True,
+        data_dir: Path | None = None,
+        config_dir: Path | None = None,
     ) -> None:
         self._plugins_dir = plugins_dir
         self._sockets_dir = sockets_dir
@@ -90,9 +95,18 @@ class PluginHost:
         self.memory_limit_bytes = memory_limit_bytes
         self._on_error = on_error
         self._on_change = on_change
+        self._data_dir = data_dir or plugins_dir.parent
+        self._config_dir = config_dir
         self._processes: dict[str, _PluginProcess] = {}
         self._restart_tasks: dict[str, asyncio.Task[None]] = {}
         self._last_errors: dict[str, str] = {}
+        self.sandbox_available = sandbox and _sandbox_available()
+        if sandbox and not self.sandbox_available:
+            self._logs.add(
+                LogLevel.WARNING,
+                "worker",
+                "plugin sandbox requested but bubblewrap/userns unavailable; plugins run without OS isolation",
+            )
 
     # --- запросы --------------------------------------------------------------
 
@@ -130,7 +144,7 @@ class PluginHost:
             record=record,
             manifest=manifest,
             directory=directory,
-            socket_path=self._sockets_dir / f"{record.id}.sock",
+            socket_path=self._sockets_dir / record.id / "plugin.sock",
             host=self,
         )
         self._processes[record.id] = process
@@ -255,6 +269,8 @@ class _PluginProcess:
         self.status = PluginStatus.STARTING
         self.last_error = None
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            self.socket_path.parent.chmod(0o700)
         with contextlib.suppress(FileNotFoundError):
             self.socket_path.unlink()
         self._connected = asyncio.get_running_loop().create_future()
@@ -270,11 +286,21 @@ class _PluginProcess:
         if sys.platform != "win32" and not _supports_prlimit():
             # Fallback для не-Linux POSIX: RLIMIT_AS до exec.
             subprocess_kwargs["preexec_fn"] = _memory_limiter(self.host.memory_limit_bytes)
+        command = (
+            _sandbox_command(
+                python=sys.executable,
+                plugin_dir=self.directory,
+                sockets_dir=self.socket_path.parent,
+                data_dir=self.host._data_dir,
+                config_dir=self.host._config_dir,
+                network=self.manifest.permissions.network,
+            )
+            if self.host.sandbox_available
+            else [sys.executable, "-m", "lucrium_plugin_sdk"]
+        )
         try:
             self._process = await asyncio.create_subprocess_exec(
-                sys.executable,
-                "-m",
-                "lucrium_plugin_sdk",
+                *command,
                 cwd=str(self.directory),
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
@@ -344,6 +370,8 @@ class _PluginProcess:
             self._server = None
         with contextlib.suppress(FileNotFoundError):
             self.socket_path.unlink()
+        with contextlib.suppress(OSError):
+            self.socket_path.parent.rmdir()
         self._connected = None
 
     # --- события --------------------------------------------------------------
@@ -478,6 +506,96 @@ class _PluginProcess:
         self.status = PluginStatus.CRASHED
         self.last_error = f"plugin exited with code {code}"
         self.host._schedule_restart(self, self.last_error)
+
+
+def _sandbox_command(
+    *,
+    python: str,
+    plugin_dir: Path,
+    sockets_dir: Path,
+    data_dir: Path,
+    config_dir: Path | None,
+    network: bool,
+) -> list[str]:
+    """bubblewrap: скрыть data/config, оставить только код плагина и сокет."""
+    command = [
+        "bwrap",
+        "--unshare-all",
+        "--die-with-parent",
+        "--new-session",
+        "--cap-drop",
+        "ALL",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--tmpfs",
+        "/tmp",
+    ]
+    if data_dir.exists():
+        command += [
+            "--tmpfs",
+            str(data_dir),
+            "--dir",
+            str(plugin_dir.parent),
+            "--dir",
+            str(plugin_dir),
+            "--dir",
+            str(sockets_dir),
+            "--ro-bind",
+            str(plugin_dir),
+            str(plugin_dir),
+            "--bind",
+            str(sockets_dir),
+            str(sockets_dir),
+        ]
+    if config_dir is not None and config_dir.exists():
+        command += ["--tmpfs", str(config_dir)]
+    if network:
+        command.append("--share-net")
+    command += [
+        "--chdir",
+        str(plugin_dir),
+        "--",
+        python,
+        "-m",
+        "lucrium_plugin_sdk",
+    ]
+    return command
+
+
+def _sandbox_available() -> bool:
+    if sys.platform != "linux" or shutil.which("bwrap") is None:
+        return False
+    try:
+        probe = subprocess.run(
+            [
+                "bwrap",
+                "--unshare-all",
+                "--die-with-parent",
+                "--cap-drop",
+                "ALL",
+                "--ro-bind",
+                "/",
+                "/",
+                "--dev",
+                "/dev",
+                "--proc",
+                "/proc",
+                "--",
+                "true",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
 
 
 def _plugin_env(directory: Path, socket_path: Path) -> dict[str, str]:

@@ -37,10 +37,13 @@ install_packages() {
   if command -v apt-get >/dev/null; then
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 python3-venv python3-pip curl ca-certificates openssl
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bubblewrap || log "bubblewrap unavailable; plugin sandbox disabled"
   elif command -v dnf >/dev/null; then
     dnf install -y -q python3 python3-pip curl ca-certificates openssl
+    dnf install -y -q bubblewrap || log "bubblewrap unavailable; plugin sandbox disabled"
   elif command -v yum >/dev/null; then
     yum install -y -q python3 python3-pip curl ca-certificates openssl
+    yum install -y -q bubblewrap || log "bubblewrap unavailable; plugin sandbox disabled"
   else
     log "unknown package manager; assuming curl/openssl are installed"
   fi

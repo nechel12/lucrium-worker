@@ -55,6 +55,7 @@ class WorkerConfig:
     log_level: str = "info"
     event_retention_days: int = 30
     plugin_memory_limit_mb: int = 512
+    plugin_sandbox: bool = True
     extra: dict[str, object] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
@@ -131,6 +132,7 @@ class WorkerConfig:
                 log_level=str(worker.get("log_level", "info")),
                 event_retention_days=_as_int(storage.get("event_retention_days", 30), "storage.event_retention_days"),
                 plugin_memory_limit_mb=_as_int(plugins.get("memory_limit_mb", 512), "plugins.memory_limit_mb"),
+                plugin_sandbox=_as_bool(plugins.get("sandbox", True), "plugins.sandbox"),
             )
         except (TypeError, ValueError) as exc:
             raise ConfigError(f"invalid config values in {file}: {exc}") from exc
@@ -156,6 +158,7 @@ class WorkerConfig:
             "",
             "[plugins]",
             f"memory_limit_mb = {self.plugin_memory_limit_mb}",
+            f"sandbox = {'true' if self.plugin_sandbox else 'false'}",
         ]
         if self.tls is not None:
             lines += [
@@ -215,6 +218,14 @@ def _as_float(value: object, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float | str):
         raise ConfigError(f"{field} must be a number")
     return float(value)
+
+
+def _as_bool(value: object, field: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    raise ConfigError(f"{field} must be a boolean")
 
 
 __all__ = [

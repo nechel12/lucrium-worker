@@ -110,6 +110,9 @@ class WorkerApp:
             on_error=self._on_plugin_error,
             on_change=self._touch,
             memory_limit_bytes=self.config.plugin_memory_limit_mb * 1024 * 1024,
+            sandbox=self.config.plugin_sandbox,
+            data_dir=self.config.data_dir,
+            config_dir=config_path.parent if config_path is not None else None,
         )
         self.connected_panels = 0
         self._started_at = datetime.now(UTC)
