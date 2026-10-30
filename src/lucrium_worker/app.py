@@ -30,6 +30,8 @@ from lucrium_protocol import (
     ExportStateParams,
     GetLogsParams,
     GetLogsResult,
+    GetPluginSchemaParams,
+    GetPluginSchemaResult,
     GetStateParams,
     ImportStateParams,
     ImportStateResult,
@@ -225,6 +227,9 @@ class WorkerApp:
         if method == Command.SET_PLUGIN_CONFIG:
             assert isinstance(payload, SetPluginConfigParams)
             return await self._set_plugin_config(payload)
+        if method == Command.GET_PLUGIN_SCHEMA:
+            assert isinstance(payload, GetPluginSchemaParams)
+            return await self._get_plugin_schema(payload)
         if method == Command.EXPORT_STATE:
             assert isinstance(payload, ExportStateParams)
             return await export_state(self.storage, payload.passphrase.get_secret_value())
@@ -402,10 +407,17 @@ class WorkerApp:
         self._touch()
         return PluginConfigResult(plugin_id=record.id, restart_triggered=restart_triggered)
 
-    def _validate_config(self, record: PluginRecord, config: dict[str, Any]) -> None:
-        directory = self.installer.directory_for(record.id)
+    async def _get_plugin_schema(self, payload: GetPluginSchemaParams) -> GetPluginSchemaResult:
+        record = await self.storage.get_plugin(payload.plugin_id)
+        if record is None:
+            raise ProtocolError(ErrorCode.NOT_FOUND, f"plugin {payload.plugin_id!r} is not installed")
         manifest = self.installer.read_manifest(record.id)
-        schema = load_config_schema(directory, manifest)
+        schema = load_config_schema(self.installer.directory_for(record.id), manifest)
+        return GetPluginSchemaResult(plugin_id=record.id, config_schema=schema, config=record.config)
+
+    def _validate_config(self, record: PluginRecord, config: dict[str, Any]) -> None:
+        manifest = self.installer.read_manifest(record.id)
+        schema = load_config_schema(self.installer.directory_for(record.id), manifest)
         if schema is None:
             return
         try:

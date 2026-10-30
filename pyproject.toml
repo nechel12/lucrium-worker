@@ -29,6 +29,9 @@ dev = [
 lucrium-protocol = { path = "../lucrium-protocol/packages/lucrium-protocol", editable = true }
 lucrium-plugin-sdk = { path = "../lucrium-protocol/packages/lucrium-plugin-sdk", editable = true }
 
+[project.scripts]
+lucrium-worker = "lucrium_worker.__main__:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

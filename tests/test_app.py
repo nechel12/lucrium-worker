@@ -114,6 +114,21 @@ async def test_set_plugin_config_validates_schema(app: WorkerApp) -> None:
     assert result.restart_triggered is False
 
 
+async def test_get_plugin_schema(app: WorkerApp) -> None:
+    from lucrium_protocol import GetPluginSchemaParams
+
+    install = InstallPluginParams(archive_b64=base64.b64encode(plugin_zip()).decode(), auto_start=False)
+    _result(app, await _call(app, Command.INSTALL_PLUGIN, install), Command.INSTALL_PLUGIN)
+    result = _result(
+        app,
+        await _call(app, Command.GET_PLUGIN_SCHEMA, GetPluginSchemaParams(plugin_id="test-plugin")),
+        Command.GET_PLUGIN_SCHEMA,
+    )
+    assert result.plugin_id == "test-plugin"
+    assert result.config_schema["properties"]["greeting"]["type"] == "string"
+    assert result.config == {}
+
+
 async def test_get_logs(app: WorkerApp) -> None:
     from lucrium_protocol import LogLevel
 

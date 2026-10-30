@@ -30,12 +30,16 @@ from .server import PanelServer
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="lucrium-worker", description="Lucrium Worker — демон панели")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="путь к worker.toml")
+
+    parser = argparse.ArgumentParser(
+        prog="lucrium-worker", description="Lucrium Worker — демон панели", parents=[common]
+    )
     parser.add_argument("--version", action="version", version=f"lucrium-worker {__version__}")
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="путь к worker.toml")
     subparsers = parser.add_subparsers(dest="command")
 
-    init = subparsers.add_parser("init", help="создать конфиг и pairing-токен")
+    init = subparsers.add_parser("init", help="создать конфиг и pairing-токен", parents=[common])
     init.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
     init.add_argument("--host", default="0.0.0.0")
     init.add_argument("--port", type=int, default=8443)
@@ -43,8 +47,8 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument("--tls-key", default=None)
     init.add_argument("--force", action="store_true", help="перезаписать существующий конфиг")
 
-    subparsers.add_parser("show-token", help="показать текущий pairing-токен")
-    subparsers.add_parser("run", help="запустить демон (по умолчанию)")
+    subparsers.add_parser("show-token", help="показать текущий pairing-токен", parents=[common])
+    subparsers.add_parser("run", help="запустить демон (по умолчанию)", parents=[common])
 
     args = parser.parse_args(argv)
     command = args.command or "run"
