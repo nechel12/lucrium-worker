@@ -100,7 +100,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
   "$WORKER_BIN" init --config "$CONFIG_FILE" --data-dir "$DATA_DIR" --port "$PORT" "${TLS_ARGS[@]}" >/dev/null
 fi
 
-chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR" "$DATA_DIR"
+chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"
 chown "$SERVICE_USER:$SERVICE_USER" "$CONFIG_FILE"
 chmod 600 "$CONFIG_FILE"
 if [ -d "$CONFIG_DIR/tls" ]; then
