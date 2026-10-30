@@ -22,8 +22,9 @@ TLS_ENABLED="${LUCRIUM_TLS:-1}"
 PYTHON_VERSION="${LUCRIUM_PYTHON:-3.12}"
 WORKER_URL="${LUCRIUM_REPO_URL:-https://github.com/nechel12/lucrium-worker.git}"
 PROTOCOL_URL="${LUCRIUM_PROTOCOL_URL:-https://github.com/nechel12/lucrium-protocol.git}"
-# Для воспроизводимой установки укажите тег/коммит: LUCRIUM_REF=v1.2.3
+# Для воспроизводимой установки укажите подписанный тег: LUCRIUM_REF=v1.2.3
 REF="${LUCRIUM_REF:-main}"
+RELEASE_SIGNING_PUBKEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILBugtb8eBzKbNrkbJ1GH9h0NPIGtm3LTODxg6iprSGW lucrium-release"
 CONFIG_FILE="$CONFIG_DIR/worker.toml"
 
 log() { printf '\033[1;34m[lucrium]\033[0m %s\n' "$*"; }
@@ -72,15 +73,43 @@ fi
 
 mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR"
 
+verify_release_tag() {
+  local target="$1" ref="$2" allowed
+  if [ "${LUCRIUM_ALLOW_UNSIGNED_TAGS:-0}" = "1" ]; then
+    log "warning: signature verification disabled by LUCRIUM_ALLOW_UNSIGNED_TAGS=1"
+    return 0
+  fi
+  allowed="$(mktemp)"
+  printf 'lucrium-release %s\n' "$RELEASE_SIGNING_PUBKEY" >"$allowed"
+  if ! git -C "$target" -c gpg.ssh.allowedSignersFile="$allowed" verify-tag "$ref" >/dev/null 2>&1; then
+    rm -f "$allowed"
+    die "release tag $ref has no valid SSH signature from the Lucrium release key"
+  fi
+  rm -f "$allowed"
+  log "verified release tag $ref"
+}
+
 clone_or_update() {
   local url="$1" target="$2"
   if [ -d "$target/.git" ]; then
     log "updating $(basename "$target") to $REF"
-    git -C "$target" fetch --quiet --depth 1 origin "$REF"
-    git -C "$target" reset --hard --quiet FETCH_HEAD
+    if printf '%s' "$REF" | grep -Eq '^v[0-9]'; then
+      git -C "$target" fetch --quiet --depth 1 origin "refs/tags/$REF:refs/tags/$REF"
+      verify_release_tag "$target" "$REF"
+      git -C "$target" reset --hard --quiet "refs/tags/$REF^{commit}"
+    else
+      log "warning: $REF is not a release tag; installing an unverified development ref"
+      git -C "$target" fetch --quiet --depth 1 origin "$REF"
+      git -C "$target" reset --hard --quiet FETCH_HEAD
+    fi
   else
     log "cloning $(basename "$target") @ $REF"
     git clone --quiet --depth 1 --branch "$REF" "$url" "$target"
+    if printf '%s' "$REF" | grep -Eq '^v[0-9]'; then
+      verify_release_tag "$target" "$REF"
+    else
+      log "warning: $REF is not a release tag; installing an unverified development ref"
+    fi
   fi
 }
 
