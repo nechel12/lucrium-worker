@@ -20,20 +20,20 @@ jobs:
         python-version: ["3.12", "3.14"]
     steps:
       - name: Checkout protocol (sibling dependency)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: nechel12/lucrium-protocol
           path: lucrium-protocol
           persist-credentials: false
 
       - name: Checkout worker
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           path: lucrium-worker
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           enable-cache: true
 
