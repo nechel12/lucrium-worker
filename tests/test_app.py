@@ -7,9 +7,11 @@ from typing import Any
 
 from lucrium_protocol import (
     AddAccountParams,
+    CallClientParams,
     Command,
     ErrorCode,
     GetLogsParams,
+    GetPluginSchemaParams,
     GetStateParams,
     ImportMode,
     ImportStateParams,
@@ -115,7 +117,6 @@ async def test_set_plugin_config_validates_schema(app: WorkerApp) -> None:
 
 
 async def test_get_plugin_schema(app: WorkerApp) -> None:
-    from lucrium_protocol import GetPluginSchemaParams
 
     install = InstallPluginParams(archive_b64=base64.b64encode(plugin_zip()).decode(), auto_start=False)
     _result(app, await _call(app, Command.INSTALL_PLUGIN, install), Command.INSTALL_PLUGIN)
@@ -127,6 +128,23 @@ async def test_get_plugin_schema(app: WorkerApp) -> None:
     assert result.plugin_id == "test-plugin"
     assert result.config_schema["properties"]["greeting"]["type"] == "string"
     assert result.config == {}
+
+
+async def test_call_client(app: WorkerApp) -> None:
+    add = AddAccountParams.model_validate(
+        {
+            "account": {
+                "platform": "funpay",
+                "label": "FunPay",
+                "credentials": {"platform": "funpay", "golden_key": "gk"},
+            }
+        }
+    )
+    ref = _result(app, await _call(app, Command.ADD_ACCOUNT, add), Command.ADD_ACCOUNT)
+    params = CallClientParams(session_id=ref.account_id, client_method="lots.list_self", params={"subcategory_id": 1})
+    result = _result(app, await _call(app, Command.CALL_CLIENT, params), Command.CALL_CLIENT)
+    assert result.data == {"ok": True, "method": "lots.list_self"}
+    assert app.sessions.calls[-1] == (ref.account_id, "lots.list_self", {"subcategory_id": 1})  # type: ignore[attr-defined]
 
 
 async def test_get_logs(app: WorkerApp) -> None:

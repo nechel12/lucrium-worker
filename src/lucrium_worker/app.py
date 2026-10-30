@@ -24,6 +24,8 @@ from lucrium_protocol import (
     AccountRef,
     AccountWithCredentials,
     AddAccountParams,
+    CallClientParams,
+    CallClientResult,
     Command,
     ErrorCode,
     Event,
@@ -80,7 +82,7 @@ from .export import ExportError, export_state, import_state
 from .logs import LogBuffer
 from .plugins.host import PluginHost
 from .plugins.installer import InstallError, PluginInstaller
-from .sessions import SessionManager
+from .sessions import SessionError, SessionManager
 from .storage import AccountRecord, PluginRecord, Storage
 
 Broadcaster = Callable[[Event], Awaitable[None]]
@@ -230,6 +232,9 @@ class WorkerApp:
         if method == Command.GET_PLUGIN_SCHEMA:
             assert isinstance(payload, GetPluginSchemaParams)
             return await self._get_plugin_schema(payload)
+        if method == Command.CALL_CLIENT:
+            assert isinstance(payload, CallClientParams)
+            return await self._call_client(payload)
         if method == Command.EXPORT_STATE:
             assert isinstance(payload, ExportStateParams)
             return await export_state(self.storage, payload.passphrase.get_secret_value())
@@ -406,6 +411,23 @@ class WorkerApp:
             await self.plugins.restart(record)
         self._touch()
         return PluginConfigResult(plugin_id=record.id, restart_triggered=restart_triggered)
+
+    async def _call_client(self, payload: CallClientParams) -> CallClientResult:
+        """Вызов клиента aiosellers из панели (лоты/товары, §9)."""
+        try:
+            runtime = self.sessions.resolve(payload.session_id)
+        except SessionError as exc:
+            raise ProtocolError(ErrorCode.NOT_FOUND, str(exc)) from exc
+        try:
+            data = await asyncio.wait_for(
+                self.sessions.call(runtime.account_id, payload.client_method, payload.params),
+                timeout=60,
+            )
+        except TimeoutError as exc:
+            raise ProtocolError(ErrorCode.UNAVAILABLE, f"call {payload.client_method} timed out") from exc
+        except (SessionError, AttributeError, TypeError) as exc:
+            raise ProtocolError(ErrorCode.INVALID_PARAMS, str(exc)) from exc
+        return CallClientResult(data=data)
 
     async def _get_plugin_schema(self, payload: GetPluginSchemaParams) -> GetPluginSchemaResult:
         record = await self.storage.get_plugin(payload.plugin_id)
