@@ -35,6 +35,7 @@ token = "<64 hex>"
 
 [storage]
 data_dir = "/var/lib/lucrium"
+event_retention_days = 30   # история событий в SQLite
 
 [tls]                       # опционально
 certfile = "/etc/lucrium/tls/cert.pem"
