@@ -148,15 +148,15 @@ Wants=network-online.target
 Type=simple
 User=$SERVICE_USER
 Group=$SERVICE_USER
-WorkingDirectory=$INSTALL_DIR/lucrium-worker
-ExecStart=$WORKER_BIN run --config $CONFIG_FILE
+WorkingDirectory="$INSTALL_DIR/lucrium-worker"
+ExecStart="$WORKER_BIN" run --config "$CONFIG_FILE"
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=$DATA_DIR $CONFIG_DIR
+ReadWritePaths="$DATA_DIR" "$CONFIG_DIR"
 LimitNOFILE=65535
 
 [Install]
