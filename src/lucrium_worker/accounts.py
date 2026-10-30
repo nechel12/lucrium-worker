@@ -58,13 +58,14 @@ class AccountService:
     async def create(self, payload: AccountInput) -> AccountRecord:
         now = datetime.now(UTC)
         record = AccountRecord(
-            id=f"acc-{secrets.token_hex(4)}",
+            id=f"acc-{secrets.token_hex(8)}",
             platform=payload.platform,
             label=payload.label,
             credentials=payload.credentials,
             proxy=payload.proxy,
             created_at=now,
             updated_at=now,
+            desired_running=True,
         )
         await self._storage.upsert_account(record)
         return record
@@ -89,6 +90,7 @@ class AccountService:
             proxy=None if clear_proxy else (proxy if proxy is not None else current.proxy),
             created_at=current.created_at,
             updated_at=datetime.now(UTC),
+            desired_running=current.desired_running,
         )
         await self._storage.upsert_account(updated)
         return updated

@@ -19,7 +19,8 @@ import aiosqlite
 from cryptography.fernet import Fernet, InvalidToken
 from lucrium_protocol import AccountCredentials, EventKind, HubEvent, Platform, PluginSource, ProxyConfig, to_wire
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+_SEALED_PREFIX = "enc1:"
 
 
 class StorageError(Exception):
@@ -35,6 +36,7 @@ class AccountRecord:
     proxy: ProxyConfig | None
     created_at: datetime
     updated_at: datetime
+    desired_running: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,7 +69,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     credentials_enc TEXT NOT NULL,
     proxy_json TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    desired_running INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS plugins (
     id TEXT PRIMARY KEY,
@@ -133,13 +136,19 @@ class Storage:
 
     async def open(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        if self._db_path.parent not in {Path("."), Path("/")}:
+            _chmod_private(self._db_path.parent, 0o700)
         self._fernet = Fernet(_load_or_create_key(self._secret_key_path))
         self._db = await aiosqlite.connect(self._db_path)
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA foreign_keys=ON")
         await self._db.executescript(_SCHEMA)
+        await self._migrate_schema()
+        await self._migrate_sealed_columns()
         await self._db.commit()
+        for path in (self._db_path, Path(f"{self._db_path}-wal"), Path(f"{self._db_path}-shm")):
+            _chmod_private(path, 0o600)
         await self.set_meta("schema_version", SCHEMA_VERSION)
 
     async def close(self) -> None:
@@ -147,6 +156,56 @@ class Storage:
             await self._db.close()
             self._db = None
         self._fernet = None
+
+    async def _migrate_schema(self) -> None:
+        cursor = await self.db.execute("PRAGMA table_info(accounts)")
+        columns = {str(row["name"]) for row in await cursor.fetchall()}
+        if "desired_running" not in columns:
+            await self.db.execute("ALTER TABLE accounts ADD COLUMN desired_running INTEGER NOT NULL DEFAULT 1")
+
+    async def _migrate_sealed_columns(self) -> None:
+        """Шифрует секреты, сохранённые старыми версиями в открытом виде."""
+        cursor = await self.db.execute("SELECT id, proxy_json FROM accounts WHERE proxy_json IS NOT NULL")
+        for row in await cursor.fetchall():
+            raw = str(row["proxy_json"])
+            if not raw.startswith(_SEALED_PREFIX):
+                await self.db.execute(
+                    "UPDATE accounts SET proxy_json = ? WHERE id = ?",
+                    (self._seal_json(json.loads(raw)), row["id"]),
+                )
+
+        cursor = await self.db.execute("SELECT id, config_json FROM plugins")
+        for row in await cursor.fetchall():
+            raw = str(row["config_json"])
+            if not raw.startswith(_SEALED_PREFIX):
+                await self.db.execute(
+                    "UPDATE plugins SET config_json = ? WHERE id = ?",
+                    (self._seal_json(json.loads(raw)), row["id"]),
+                )
+
+        cursor = await self.db.execute("SELECT plugin_id, key, value_json FROM plugin_kv")
+        for row in await cursor.fetchall():
+            raw = str(row["value_json"])
+            if not raw.startswith(_SEALED_PREFIX):
+                await self.db.execute(
+                    "UPDATE plugin_kv SET value_json = ? WHERE plugin_id = ? AND key = ?",
+                    (self._seal_json(json.loads(raw)), row["plugin_id"], row["key"]),
+                )
+
+    def _seal_json(self, value: Any) -> str:
+        payload = json.dumps(value, ensure_ascii=False)
+        return _SEALED_PREFIX + self.fernet.encrypt(payload.encode()).decode()
+
+    def _open_json(self, raw: str) -> Any:
+        if raw.startswith(_SEALED_PREFIX):
+            return json.loads(self.fernet.decrypt(raw[len(_SEALED_PREFIX) :].encode()).decode())
+        return json.loads(raw)
+
+    def _open_secret_json(self, raw: str) -> Any:
+        try:
+            return self._open_json(raw)
+        except InvalidToken as exc:
+            raise StorageError("cannot decrypt secret: secret.key changed or database corrupted") from exc
 
     # --- meta -----------------------------------------------------------------
 
@@ -174,18 +233,20 @@ class Storage:
         row = await cursor.fetchone()
         return None if row is None else self._account_from_row(row)
 
-    async def upsert_account(self, record: AccountRecord) -> None:
+    async def upsert_account(self, record: AccountRecord, *, commit: bool = True) -> None:
         credentials = self._encrypt(json.dumps(to_wire(record.credentials), ensure_ascii=False))
-        proxy_json = None if record.proxy is None else json.dumps(to_wire(record.proxy), ensure_ascii=False)
+        proxy_json = None if record.proxy is None else self._seal_json(to_wire(record.proxy))
         await self.db.execute(
             """
-            INSERT INTO accounts (id, platform, label, credentials_enc, proxy_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO accounts
+                (id, platform, label, credentials_enc, proxy_json, created_at, updated_at, desired_running)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 platform = excluded.platform,
                 label = excluded.label,
                 credentials_enc = excluded.credentials_enc,
                 proxy_json = excluded.proxy_json,
+                desired_running = excluded.desired_running,
                 updated_at = excluded.updated_at
             """,
             (
@@ -196,7 +257,16 @@ class Storage:
                 proxy_json,
                 _iso(record.created_at),
                 _iso(record.updated_at),
+                int(record.desired_running),
             ),
+        )
+        if commit:
+            await self.db.commit()
+
+    async def set_account_desired_running(self, account_id: str, desired: bool) -> None:
+        await self.db.execute(
+            "UPDATE accounts SET desired_running = ?, updated_at = ? WHERE id = ?",
+            (int(desired), _iso(_now()), account_id),
         )
         await self.db.commit()
 
@@ -212,9 +282,10 @@ class Storage:
             platform=Platform(row["platform"]),
             label=row["label"],
             credentials=AccountCredentials.model_validate(json.loads(self._decrypt(row["credentials_enc"]))),
-            proxy=None if proxy_raw is None else ProxyConfig.model_validate(json.loads(proxy_raw)),
+            proxy=None if proxy_raw is None else ProxyConfig.model_validate(self._open_secret_json(str(proxy_raw))),
             created_at=_parse_dt(row["created_at"]),
             updated_at=_parse_dt(row["updated_at"]),
+            desired_running=bool(row["desired_running"]),
         )
 
     # --- plugins --------------------------------------------------------------
@@ -228,7 +299,7 @@ class Storage:
         row = await cursor.fetchone()
         return None if row is None else self._plugin_from_row(row)
 
-    async def upsert_plugin(self, record: PluginRecord) -> None:
+    async def upsert_plugin(self, record: PluginRecord, *, commit: bool = True) -> None:
         await self.db.execute(
             """
             INSERT INTO plugins (id, name, version, api, source, enabled, config_json, installed_at, updated_at)
@@ -249,12 +320,13 @@ class Storage:
                 record.api,
                 record.source.value,
                 int(record.enabled),
-                json.dumps(record.config, ensure_ascii=False),
+                self._seal_json(record.config),
                 _iso(record.installed_at),
                 _iso(record.updated_at),
             ),
         )
-        await self.db.commit()
+        if commit:
+            await self.db.commit()
 
     async def delete_plugin(self, plugin_id: str, *, purge_data: bool) -> bool:
         cursor = await self.db.execute("DELETE FROM plugins WHERE id = ?", (plugin_id,))
@@ -271,7 +343,7 @@ class Storage:
             api=row["api"],
             source=PluginSource(row["source"]),
             enabled=bool(row["enabled"]),
-            config=json.loads(row["config_json"]),
+            config=self._open_secret_json(str(row["config_json"])),
             installed_at=_parse_dt(row["installed_at"]),
             updated_at=_parse_dt(row["updated_at"]),
         )
@@ -283,25 +355,27 @@ class Storage:
             "SELECT value_json FROM plugin_kv WHERE plugin_id = ? AND key = ?", (plugin_id, key)
         )
         row = await cursor.fetchone()
-        return None if row is None else json.loads(row["value_json"])
+        return None if row is None else self._open_secret_json(str(row["value_json"]))
 
-    async def kv_set(self, plugin_id: str, key: str, value: Any) -> None:
-        payload = json.dumps(value, ensure_ascii=False)
+    async def kv_set(self, plugin_id: str, key: str, value: Any, *, commit: bool = True) -> None:
+        payload = self._seal_json(value)
         await self.db.execute(
             "INSERT INTO plugin_kv (plugin_id, key, value_json) VALUES (?, ?, ?) "
             "ON CONFLICT(plugin_id, key) DO UPDATE SET value_json = excluded.value_json",
             (plugin_id, key, payload),
         )
-        await self.db.commit()
+        if commit:
+            await self.db.commit()
 
     async def kv_delete(self, plugin_id: str, key: str) -> None:
         await self.db.execute("DELETE FROM plugin_kv WHERE plugin_id = ? AND key = ?", (plugin_id, key))
         await self.db.commit()
 
     async def kv_keys(self, plugin_id: str, prefix: str = "") -> list[str]:
+        # substr вместо LIKE: префикс должен быть литеральным и регистрозависимым.
         cursor = await self.db.execute(
-            "SELECT key FROM plugin_kv WHERE plugin_id = ? AND key LIKE ? ORDER BY key",
-            (plugin_id, f"{prefix}%"),
+            "SELECT key FROM plugin_kv WHERE plugin_id = ? AND substr(key, 1, length(?)) = ? ORDER BY key",
+            (plugin_id, prefix, prefix),
         )
         return [row["key"] for row in await cursor.fetchall()]
 
@@ -309,11 +383,11 @@ class Storage:
         cursor = await self.db.execute(
             "SELECT key, value_json FROM plugin_kv WHERE plugin_id = ? ORDER BY key", (plugin_id,)
         )
-        return [(row["key"], json.loads(row["value_json"])) for row in await cursor.fetchall()]
+        return [(row["key"], self._open_secret_json(str(row["value_json"]))) for row in await cursor.fetchall()]
 
     # --- история событий ------------------------------------------------------
 
-    async def add_event(self, event: HubEvent) -> int:
+    async def add_event(self, event: HubEvent, *, commit: bool = True) -> int:
         cursor = await self.db.execute(
             "INSERT INTO events (ts, platform, session_id, kind, payload_json) VALUES (?, ?, ?, ?, ?)",
             (
@@ -324,8 +398,13 @@ class Storage:
                 event.model_dump_json(),
             ),
         )
-        await self.db.commit()
+        if commit:
+            await self.db.commit()
         return int(cursor.lastrowid or 0)
+
+    async def list_all_events(self) -> list[HubEvent]:
+        cursor = await self.db.execute("SELECT payload_json FROM events ORDER BY id")
+        return [HubEvent.model_validate_json(row["payload_json"]) for row in await cursor.fetchall()]
 
     async def list_events(
         self,
@@ -359,12 +438,14 @@ class Storage:
         await self.db.commit()
         return cursor.rowcount
 
-    async def clear_all(self) -> None:
-        """Очищает аккаунты/плагины/KV (режим ``import_state`` = replace)."""
+    async def clear_all(self, *, commit: bool = True) -> None:
+        """Очищает аккаунты/плагины/KV/историю (режим ``import_state`` = replace)."""
         await self.db.execute("DELETE FROM accounts")
         await self.db.execute("DELETE FROM plugins")
         await self.db.execute("DELETE FROM plugin_kv")
-        await self.db.commit()
+        await self.db.execute("DELETE FROM events")
+        if commit:
+            await self.db.commit()
 
     # --- crypto ---------------------------------------------------------------
 
@@ -378,14 +459,31 @@ class Storage:
             raise StorageError("cannot decrypt credentials: secret.key changed or database corrupted") from exc
 
 
+def _chmod_private(path: Path, mode: int) -> None:
+    with contextlib.suppress(OSError):
+        os.chmod(path, mode)
+
+
 def _load_or_create_key(path: Path) -> bytes:
-    if path.is_file():
-        return path.read_bytes().strip()
+    try:
+        existing = path.read_bytes().strip()
+    except FileNotFoundError:
+        existing = b""
+    if existing:
+        return existing
     path.parent.mkdir(parents=True, exist_ok=True)
     key = Fernet.generate_key()
-    path.write_bytes(key + b"\n")
-    with contextlib.suppress(OSError):  # Windows
-        os.chmod(path, 0o600)
+    try:
+        # O_EXCL защищает от гонки двух одновременных запусков воркера.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        existing = path.read_bytes().strip()
+        if not existing:
+            raise StorageError(f"secret key file is empty: {path}") from None
+        return existing
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(key + b"\n")
+    _chmod_private(path, 0o600)
     return key
 
 

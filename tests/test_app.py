@@ -16,12 +16,17 @@ from lucrium_protocol import (
     ImportMode,
     ImportStateParams,
     InstallPluginParams,
+    LogLevel,
     LogScope,
     PingParams,
     RemoveAccountParams,
     Response,
+    SessionStatus,
     SetPluginConfigParams,
     StateWithCredentials,
+    StopSessionParams,
+    UpdateAccountParams,
+    UpdatePluginParams,
     build_request,
     decode_result,
     parse_envelope,
@@ -30,7 +35,7 @@ from pydantic import SecretStr
 
 from lucrium_worker.app import WorkerApp
 
-from .conftest import plugin_zip
+from .conftest import PLUGIN_MAIN, PLUGIN_SCHEMA, PLUGIN_TOML, make_zip, plugin_zip
 
 
 async def _call(app: WorkerApp, command: Command, params: Any) -> Response:
@@ -228,6 +233,116 @@ async def test_export_import_via_commands(app: WorkerApp) -> None:
     assert len(accounts) == 1
     assert accounts[0].platform.value == "playerok"
     assert accounts[0].credentials.secret_value() == "po-token"
+
+
+async def test_wrong_passphrase_does_not_stop_sessions(app: WorkerApp) -> None:
+    add = AddAccountParams.model_validate(
+        {
+            "account": {
+                "platform": "funpay",
+                "label": "FunPay",
+                "credentials": {"platform": "funpay", "golden_key": "gk"},
+            }
+        }
+    )
+    _result(app, await _call(app, Command.ADD_ACCOUNT, add), Command.ADD_ACCOUNT)
+    export = _result(
+        app,
+        await app.handle_request(build_request(Command.EXPORT_STATE, _export_params("passphrase-123"))),
+        Command.EXPORT_STATE,
+    )
+    app.sessions.stopped.clear()  # type: ignore[attr-defined]
+
+    response = await _call(
+        app,
+        Command.IMPORT_STATE,
+        ImportStateParams(
+            blob_b64=export.blob_b64,
+            passphrase=SecretStr("wrong-passphrase"),
+            mode=ImportMode.MERGE,
+        ),
+    )
+    assert response.payload.error is not None
+    assert response.payload.error.code is ErrorCode.INVALID_PARAMS
+    assert app.sessions.stopped == []  # type: ignore[attr-defined]
+
+
+async def test_stop_session_persists_desired_running(app: WorkerApp) -> None:
+    add = AddAccountParams.model_validate(
+        {
+            "account": {
+                "platform": "funpay",
+                "label": "FunPay",
+                "credentials": {"platform": "funpay", "golden_key": "gk"},
+            }
+        }
+    )
+    ref = _result(app, await _call(app, Command.ADD_ACCOUNT, add), Command.ADD_ACCOUNT)
+    _result(
+        app,
+        await _call(app, Command.STOP_SESSION, StopSessionParams(account_id=ref.account_id)),
+        Command.STOP_SESSION,
+    )
+    record = await app.storage.get_account(ref.account_id)
+    assert record is not None and record.desired_running is False
+
+
+async def test_update_account_restarts_error_session(app: WorkerApp) -> None:
+    add = AddAccountParams.model_validate(
+        {
+            "account": {
+                "platform": "funpay",
+                "label": "FunPay",
+                "credentials": {"platform": "funpay", "golden_key": "gk"},
+            }
+        }
+    )
+    ref = _result(app, await _call(app, Command.ADD_ACCOUNT, add), Command.ADD_ACCOUNT)
+    app.sessions.statuses[ref.account_id] = SessionStatus.ERROR  # type: ignore[attr-defined]
+    started_before = len(app.sessions.started)  # type: ignore[attr-defined]
+
+    _result(
+        app,
+        await _call(
+            app,
+            Command.UPDATE_ACCOUNT,
+            UpdateAccountParams(account_id=ref.account_id, label="Новое имя"),
+        ),
+        Command.UPDATE_ACCOUNT,
+    )
+    assert len(app.sessions.started) == started_before + 1  # type: ignore[attr-defined]
+    assert ref.account_id in app.sessions.stopped  # type: ignore[attr-defined]
+
+
+async def test_get_logs_returns_latest_entries(app: WorkerApp) -> None:
+    for index in range(300):
+        app.logs.add(LogLevel.INFO, "worker", f"line {index}")
+    result = _result(
+        app,
+        await _call(app, Command.GET_LOGS, GetLogsParams(scope=LogScope.WORKER, limit=200)),
+        Command.GET_LOGS,
+    )
+    assert result.entries[0].message == "line 100"
+    assert result.entries[-1].message == "line 299"
+
+
+async def test_update_plugin_with_wrong_id_does_not_touch_existing(app: WorkerApp) -> None:
+    install = InstallPluginParams(archive_b64=base64.b64encode(plugin_zip()).decode(), auto_start=False)
+    _result(app, await _call(app, Command.INSTALL_PLUGIN, install), Command.INSTALL_PLUGIN)
+    other = PLUGIN_TOML.replace('id = "test-plugin"', 'id = "other-plugin"')
+    archive = make_zip({"plugin.toml": other, "config_schema.json": PLUGIN_SCHEMA, "plugin_main.py": PLUGIN_MAIN})
+    response = await _call(
+        app,
+        Command.UPDATE_PLUGIN,
+        UpdatePluginParams(
+            plugin_id="test-plugin",
+            archive_b64=base64.b64encode(archive).decode(),
+            auto_restart=False,
+        ),
+    )
+    assert response.payload.error is not None
+    assert (app.config.plugins_dir / "test-plugin" / "plugin.toml").is_file()
+    assert not (app.config.plugins_dir / "other-plugin").exists()
 
 
 def _export_params(passphrase: str) -> Any:

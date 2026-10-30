@@ -20,6 +20,7 @@ from typing import Any
 import jsonschema
 from lucrium_plugin_sdk.manifest import load_config_schema
 from lucrium_protocol import (
+    PROTOCOL_VERSION,
     AccountInput,
     AccountRef,
     AccountWithCredentials,
@@ -80,7 +81,7 @@ from lucrium_protocol import (
 from . import __version__
 from .accounts import AccountError, AccountService
 from .config import WorkerConfig, ensure_directories
-from .export import ExportError, export_state, import_state
+from .export import ExportError, export_state, import_state, parse_state_dump
 from .logs import LogBuffer
 from .plugins.host import PluginHost
 from .plugins.installer import InstallError, PluginInstaller
@@ -140,8 +141,8 @@ class WorkerApp:
         await self.storage.open()
         self.logs.set_listener(self._on_log_entry)
         self.logs.set_file(self.config.logs_dir / "worker.log")
-        await self._restore_plugins()
         await self._restore_sessions()
+        await self._restore_plugins()
         await self._purge_events()
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="worker-heartbeat")
         self._retention_task = asyncio.create_task(self._retention_loop(), name="worker-retention")
@@ -191,6 +192,8 @@ class WorkerApp:
 
     async def _restore_sessions(self) -> None:
         for record in await self.storage.list_accounts():
+            if not record.desired_running:
+                continue
             try:
                 await self.sessions.start(record)
             except Exception as exc:
@@ -249,7 +252,15 @@ class WorkerApp:
             return await self._call_client(payload)
         if method == Command.EXPORT_STATE:
             assert isinstance(payload, ExportStateParams)
-            return await export_state(self.storage, payload.passphrase.get_secret_value())
+            try:
+                return await export_state(
+                    self.storage,
+                    payload.passphrase.get_secret_value(),
+                    include_history=payload.include_history,
+                    plugins_dir=self.config.plugins_dir,
+                )
+            except ExportError as exc:
+                raise ProtocolError(ErrorCode.INVALID_PARAMS, str(exc)) from exc
         if method == Command.IMPORT_STATE:
             assert isinstance(payload, ImportStateParams)
             return await self._import_state(payload)
@@ -289,7 +300,9 @@ class WorkerApp:
             )
         except AccountError as exc:
             raise ProtocolError(ErrorCode.NOT_FOUND, str(exc)) from exc
-        if self.sessions.is_running(record.id):
+        # Перезапускаем и RUNNING, и ERROR/STARTING: supervisor держит старый
+        # record и иначе продолжит ретраиться со старыми кредами.
+        if self.sessions.runtime(record.id) is not None:
             await self.sessions.stop(record.id)
             await self.sessions.start(record)
         self._touch()
@@ -301,6 +314,9 @@ class WorkerApp:
         except AccountError as exc:
             raise ProtocolError(ErrorCode.NOT_FOUND, str(exc)) from exc
         await self.sessions.stop(record.id)
+        if Path(record.id).name == record.id:
+            for suffix in ("", "-wal", "-shm"):
+                (self.config.data_dir / "sessions" / f"{record.id}.db{suffix}").unlink(missing_ok=True)
         self._touch()
         return AccountRef(account_id=record.id)
 
@@ -309,6 +325,7 @@ class WorkerApp:
             record = await self.accounts.get(payload.account_id)
         except AccountError as exc:
             raise ProtocolError(ErrorCode.NOT_FOUND, str(exc)) from exc
+        await self.storage.set_account_desired_running(record.id, True)
         await self.sessions.start(record)
         self._touch()
         return SessionRef(account_id=record.id, status=self.sessions.status(record.id))
@@ -318,6 +335,7 @@ class WorkerApp:
             record = await self.accounts.get(payload.account_id)
         except AccountError as exc:
             raise ProtocolError(ErrorCode.NOT_FOUND, str(exc)) from exc
+        await self.storage.set_account_desired_running(record.id, False)
         await self.sessions.stop(record.id)
         self._touch()
         return SessionRef(account_id=record.id, status=self.sessions.status(record.id))
@@ -346,8 +364,22 @@ class WorkerApp:
         )
         await self.storage.upsert_plugin(record)
         if payload.auto_start and record.enabled:
-            with contextlib.suppress(Exception):
-                await self.plugins.start(record)
+            try:
+                if self.plugins.status(record.id) in {
+                    PluginStatus.RUNNING,
+                    PluginStatus.STARTING,
+                    PluginStatus.CRASHED,
+                    PluginStatus.RESTARTING,
+                }:
+                    await self.plugins.restart(record)
+                else:
+                    await self.plugins.start(record)
+            except Exception as exc:
+                self.logs.add(
+                    LogLevel.ERROR,
+                    record.id,
+                    f"plugin installed but cannot start: {type(exc).__name__}: {exc}",
+                )
         self._touch()
         return await self._plugin_state(record)
 
@@ -358,19 +390,23 @@ class WorkerApp:
         archive = decode_b64(payload.archive_b64, field="archive_b64")
         _verify_sha256(archive, payload.sha256)
         try:
-            installed = self.installer.install(archive, overwrite=True)
+            incoming = self.installer.inspect(archive)
         except InstallError as exc:
             raise ProtocolError(ErrorCode.INVALID_PARAMS, str(exc)) from exc
-        if installed.manifest.id != existing.id:
+        if incoming.id != existing.id:
             raise ProtocolError(
                 ErrorCode.INVALID_PARAMS,
-                f"archive contains {installed.manifest.id!r}, expected {existing.id!r}",
+                f"archive contains {incoming.id!r}, expected {existing.id!r}",
             )
+        try:
+            self.installer.install(archive, overwrite=True)
+        except InstallError as exc:
+            raise ProtocolError(ErrorCode.INVALID_PARAMS, str(exc)) from exc
         record = PluginRecord(
             id=existing.id,
-            name=installed.manifest.name,
-            version=installed.manifest.version,
-            api=installed.manifest.api,
+            name=incoming.name,
+            version=incoming.version,
+            api=incoming.api,
             source=existing.source,
             enabled=existing.enabled,
             config=existing.config,
@@ -394,7 +430,10 @@ class WorkerApp:
         if existing is None:
             raise ProtocolError(ErrorCode.NOT_FOUND, f"plugin {payload.plugin_id!r} is not installed")
         await self.plugins.stop(existing.id, reason="plugin removed")
-        self.installer.remove(existing.id)
+        try:
+            self.installer.remove(existing.id)
+        except InstallError as exc:
+            raise ProtocolError(ErrorCode.INVALID_PARAMS, str(exc)) from exc
         await self.storage.delete_plugin(existing.id, purge_data=payload.purge_data)
         self._touch()
         return PluginRef(plugin_id=existing.id)
@@ -458,9 +497,12 @@ class WorkerApp:
         if schema is None:
             return
         try:
-            jsonschema.Draft202012Validator(schema).validate(config)
-        except jsonschema.ValidationError as exc:
-            raise ProtocolError(ErrorCode.INVALID_PARAMS, f"invalid config: {exc.message}") from exc
+            validator = jsonschema.Draft202012Validator(schema)
+            validator.validate(config)
+        except (jsonschema.ValidationError, jsonschema.SchemaError) as exc:
+            raise ProtocolError(ErrorCode.INVALID_PARAMS, f"invalid config: {exc}") from exc
+        except Exception as exc:  # неразрешимый $ref/битая схема плагина
+            raise ProtocolError(ErrorCode.INVALID_PARAMS, f"invalid config schema: {exc}") from exc
 
     # --- состояние ------------------------------------------------------------
 
@@ -472,7 +514,7 @@ class WorkerApp:
             generated_at=datetime.now(UTC),
             status=self.worker_status(accounts=accounts, plugins=plugins),
             accounts=[self._account_state(record) for record in accounts],
-            plugins=[await self._plugin_state(record) for record in plugins],
+            plugins=[await self._plugin_state(record, include_config=False) for record in plugins],
         )
 
     async def state_with_credentials(self) -> StateWithCredentials:
@@ -494,7 +536,7 @@ class WorkerApp:
                 )
                 for record in accounts
             ],
-            plugins=[await self._plugin_state(record) for record in plugins],
+            plugins=[await self._plugin_state(record, include_config=False) for record in plugins],
         )
 
     def _account_state(self, record: AccountRecord) -> Any:
@@ -502,12 +544,12 @@ class WorkerApp:
         return AccountService.to_state(
             record,
             status=self.sessions.status(record.id),
-            last_error=None if runtime is None else runtime.last_error,
+            last_error=None if runtime is None or runtime.last_error is None else runtime.last_error[:2000],
             last_event_at=None if runtime is None else runtime.last_event_at,
             restarts=0 if runtime is None else runtime.restarts,
         )
 
-    async def _plugin_state(self, record: PluginRecord) -> PluginState:
+    async def _plugin_state(self, record: PluginRecord, *, include_config: bool = True) -> PluginState:
         status = self.plugins.status(record.id)
         if not record.enabled:
             status = PluginStatus.STOPPED
@@ -523,9 +565,9 @@ class WorkerApp:
             enabled=record.enabled,
             status=status,
             restarts=self.plugins.restarts(record.id),
-            last_error=self.plugins.last_error(record.id),
+            last_error=(self.plugins.last_error(record.id) or "")[:2000] or None,
             has_config_schema=has_schema,
-            config=record.config,
+            config=record.config if include_config else {},
             installed_at=record.installed_at,
             updated_at=record.updated_at,
         )
@@ -537,7 +579,7 @@ class WorkerApp:
         error_plugins = sum(1 for record in plugins if self.plugins.status(record.id) is PluginStatus.CRASHED)
         return WorkerStatus(
             version=__version__,
-            protocol="1",
+            protocol=PROTOCOL_VERSION,
             started_at=self._started_at,
             uptime_seconds=(datetime.now(UTC) - self._started_at).total_seconds(),
             python=platform_module.python_version(),
@@ -598,10 +640,15 @@ class WorkerApp:
     async def _heartbeat_loop(self) -> None:
         while True:
             await asyncio.sleep(self.config.heartbeat_seconds)
-            accounts = await self.accounts.list()
-            plugins = await self.storage.list_plugins()
-            status = self.worker_status(accounts=accounts, plugins=plugins)
-            await self.broadcast(build_event(ServerEvent.STATUS, status))
+            try:
+                accounts = await self.accounts.list()
+                plugins = await self.storage.list_plugins()
+                status = self.worker_status(accounts=accounts, plugins=plugins)
+                await self.broadcast(build_event(ServerEvent.STATUS, status))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.logs.add(LogLevel.WARNING, "worker", f"heartbeat failed: {type(exc).__name__}: {exc}")
 
     async def _retention_loop(self) -> None:
         while True:
@@ -621,6 +668,15 @@ class WorkerApp:
     # --- прочее ---------------------------------------------------------------
 
     def _get_logs(self, payload: GetLogsParams) -> GetLogsResult:
+        # Без cursor панель хочет «последние N», а не первые N из буфера.
+        if payload.cursor is None:
+            entries = self.logs.tail(
+                scope=payload.scope,
+                plugin_id=payload.plugin_id,
+                level=payload.level,
+                limit=payload.limit,
+            )
+            return GetLogsResult(entries=entries, next_cursor=None)
         entries, next_cursor = self.logs.query(
             scope=payload.scope,
             plugin_id=payload.plugin_id,
@@ -670,21 +726,40 @@ class WorkerApp:
 
     async def _import_state(self, payload: ImportStateParams) -> ImportStateResult:
         raw = decode_b64(payload.blob_b64, field="blob_b64")
+        passphrase = payload.passphrase.get_secret_value()
+        # Сначала полностью проверяем дамп. Неверный пароль/битый файл не должен
+        # останавливать работающие сессии и плагины.
+        try:
+            parsed = await asyncio.to_thread(parse_state_dump, raw, passphrase)
+        except ExportError as exc:
+            raise ProtocolError(ErrorCode.INVALID_PARAMS, str(exc)) from exc
+
         await self.plugins.stop_all()
         await self.sessions.stop_all()
         try:
             result = await import_state(
                 self.storage,
                 raw,
-                payload.passphrase.get_secret_value(),
+                passphrase,
                 mode=payload.mode,
+                plugins_dir=self.config.plugins_dir,
+                parsed=parsed,
             )
         except ExportError as exc:
             raise ProtocolError(ErrorCode.INVALID_PARAMS, str(exc)) from exc
-        await self._restore_plugins()
-        await self._restore_sessions()
-        self._touch()
-        return result.model_copy(update={"sessions_started": len(await self.storage.list_accounts())})
+        finally:
+            # Даже при ошибке импорта возвращаем воркер в рабочее состояние
+            # (БД откатывается транзакцией, файлы плагинов — backup'ом).
+            await self._restore_sessions()
+            await self._restore_plugins()
+            self._touch()
+        return result.model_copy(
+            update={
+                "sessions_started": len(
+                    [record for record in await self.storage.list_accounts() if record.desired_running]
+                )
+            }
+        )
 
 
 def _verify_sha256(archive: bytes, expected: str | None) -> None:

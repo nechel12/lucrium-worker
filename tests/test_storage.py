@@ -44,6 +44,61 @@ async def test_account_crud(storage: Storage) -> None:
     assert await storage.delete_account("acc-1") is False
 
 
+async def test_proxy_and_plugin_secrets_are_encrypted_at_rest(storage: Storage) -> None:
+    from dataclasses import replace
+    from datetime import UTC, datetime
+
+    from lucrium_protocol import PluginSource, ProxyConfig
+
+    now = datetime.now(UTC)
+    account = replace(
+        make_account("acc-proxy"),
+        proxy=ProxyConfig(host="1.2.3.4", port=8080, username="u", password="proxy-secret"),
+    )
+    await storage.upsert_account(account)
+    await storage.upsert_plugin(
+        PluginRecord(
+            id="test-plugin",
+            name="Тест",
+            version="1.0.0",
+            api="1",
+            source=PluginSource.LOCAL,
+            enabled=True,
+            config={"api_key": "plugin-secret"},
+            installed_at=now,
+            updated_at=now,
+        )
+    )
+    await storage.kv_set("test-plugin", "token", "kv-secret")
+
+    cursor = await storage.db.execute("SELECT proxy_json FROM accounts WHERE id = ?", ("acc-proxy",))
+    proxy_row = await cursor.fetchone()
+    cursor = await storage.db.execute("SELECT config_json FROM plugins WHERE id = ?", ("test-plugin",))
+    config_row = await cursor.fetchone()
+    cursor = await storage.db.execute("SELECT value_json FROM plugin_kv WHERE plugin_id = ?", ("test-plugin",))
+    kv_row = await cursor.fetchone()
+    assert proxy_row is not None and "proxy-secret" not in proxy_row["proxy_json"]
+    assert config_row is not None and "plugin-secret" not in config_row["config_json"]
+    assert kv_row is not None and "kv-secret" not in kv_row["value_json"]
+
+    loaded = await storage.get_account("acc-proxy")
+    assert loaded is not None and loaded.proxy is not None
+    assert loaded.proxy.password is not None
+    assert loaded.proxy.password.get_secret_value() == "proxy-secret"
+    assert await storage.kv_get("test-plugin", "token") == "kv-secret"
+
+
+async def test_desired_running_and_kv_prefix_are_strict(storage: Storage) -> None:
+    await storage.upsert_account(make_account("acc-1"))
+    await storage.set_account_desired_running("acc-1", False)
+    loaded = await storage.get_account("acc-1")
+    assert loaded is not None and loaded.desired_running is False
+
+    await storage.kv_set("p", "a%b", 1)
+    await storage.kv_set("p", "axb", 2)
+    assert await storage.kv_keys("p", "a%") == ["a%b"]
+
+
 async def test_plugin_crud_and_kv(storage: Storage, tmp_path: Path) -> None:
     from datetime import UTC, datetime
 
@@ -138,8 +193,22 @@ async def test_meta_json(storage: Storage) -> None:
 
 
 async def test_clear_all(storage: Storage) -> None:
+    from datetime import UTC, datetime
+
+    from lucrium_protocol import EventKind, HubEvent, Platform
+
     await storage.upsert_account(make_account())
     await storage.kv_set("test-plugin", "k", "v")
+    await storage.add_event(
+        HubEvent(
+            platform=Platform.FUNPAY,
+            session_id="acc-1",
+            kind=EventKind.MESSAGE,
+            payload={},
+            ts=datetime.now(UTC),
+        )
+    )
     await storage.clear_all()
     assert await storage.list_accounts() == []
     assert await storage.kv_keys("test-plugin") == []
+    assert await storage.list_all_events() == []
