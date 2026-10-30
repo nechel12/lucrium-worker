@@ -267,8 +267,8 @@ class _PluginProcess:
             self.socket_path.chmod(0o600)
         env = _plugin_env(self.directory, self.socket_path)
         subprocess_kwargs: dict[str, Any] = {}
-        if sys.platform != "win32":
-            # RLIMIT_AS: плагин не должен съесть память VPS (спека §6.3)
+        if sys.platform != "win32" and not _supports_prlimit():
+            # Fallback для не-Linux POSIX: RLIMIT_AS до exec.
             subprocess_kwargs["preexec_fn"] = _memory_limiter(self.host.memory_limit_bytes)
         try:
             self._process = await asyncio.create_subprocess_exec(
@@ -281,6 +281,8 @@ class _PluginProcess:
                 stderr=asyncio.subprocess.PIPE,
                 **subprocess_kwargs,
             )
+            if sys.platform != "win32" and _supports_prlimit():
+                _apply_memory_limit(self._process.pid, self.host.memory_limit_bytes)
             self._tasks = [
                 asyncio.create_task(self._pump_output(self._process.stdout, "stdout"), name="plugin-stdout"),
                 asyncio.create_task(self._pump_output(self._process.stderr, "stderr"), name="plugin-stderr"),
@@ -508,8 +510,28 @@ def _rpc_error(code: int, message: str) -> RpcError:
     return RpcError(code=code, message=message)
 
 
+def _supports_prlimit() -> bool:
+    if sys.platform == "win32":
+        return False
+    try:
+        import resource
+    except ImportError:
+        return False
+    return hasattr(resource, "prlimit")
+
+
+def _apply_memory_limit(pid: int, limit_bytes: int) -> None:
+    """Ставит RLIMIT_AS уже запущенному процессу, без preexec_fn (thread-safe)."""
+    try:
+        import resource
+
+        resource.prlimit(pid, resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+    except (ImportError, OSError, ValueError):
+        return
+
+
 def _memory_limiter(limit_bytes: int) -> Callable[[], None]:
-    """``preexec_fn``: жёсткий лимит виртуальной памяти процесса плагина."""
+    """Fallback ``preexec_fn`` для POSIX без ``resource.prlimit``."""
 
     def _limit() -> None:
         import resource
