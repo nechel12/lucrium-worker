@@ -1,0 +1,184 @@
+"""Тесты ядра воркера: команды панели, состояние, плагины без процессов."""
+
+from __future__ import annotations
+
+import base64
+from typing import Any
+
+from lucrium_protocol import (
+    AddAccountParams,
+    Command,
+    ErrorCode,
+    GetLogsParams,
+    GetStateParams,
+    ImportMode,
+    ImportStateParams,
+    InstallPluginParams,
+    LogScope,
+    PingParams,
+    RemoveAccountParams,
+    Response,
+    SetPluginConfigParams,
+    StateWithCredentials,
+    build_request,
+    decode_result,
+    parse_envelope,
+)
+from pydantic import SecretStr
+
+from lucrium_worker.app import WorkerApp
+
+from .conftest import plugin_zip
+
+
+async def _call(app: WorkerApp, command: Command, params: Any) -> Response:
+    response = await app.handle_request(build_request(command, params))
+    parsed = parse_envelope(response.model_dump_json())
+    assert isinstance(parsed, Response)
+    return parsed
+
+
+def _result(app: WorkerApp, response: Response, command: Command) -> Any:
+    assert response.payload.error is None, response.payload.error
+    return decode_result(command, response.payload.result or {})
+
+
+async def test_ping(app: WorkerApp) -> None:
+    response = await _call(app, Command.PING, PingParams(nonce="abc"))
+    result = _result(app, response, Command.PING)
+    assert result.nonce == "abc"
+    assert result.revision >= 0
+
+
+async def test_add_account_and_get_state_with_credentials(app: WorkerApp) -> None:
+    params = AddAccountParams.model_validate(
+        {
+            "account": {
+                "platform": "funpay",
+                "label": "Основной",
+                "credentials": {"platform": "funpay", "golden_key": "gk-live"},
+            }
+        }
+    )
+    response = await _call(app, Command.ADD_ACCOUNT, params)
+    ref = _result(app, response, Command.ADD_ACCOUNT)
+    assert ref.account_id.startswith("acc-")
+    assert app.sessions.started == [ref.account_id]  # type: ignore[attr-defined]
+
+    state = _result(app, await _call(app, Command.GET_STATE, GetStateParams()), Command.GET_STATE)
+    assert isinstance(state, StateWithCredentials)
+    assert state.accounts[0].account.credentials.secret_value() == "gk-live"
+
+    snapshot = await app.state_snapshot()
+    assert snapshot.accounts[0].capabilities  # FunPay: messages/orders/...
+    assert "gk-live" not in snapshot.model_dump_json()
+
+
+async def test_remove_account_stops_session(app: WorkerApp) -> None:
+    params = AddAccountParams.model_validate(
+        {
+            "account": {
+                "platform": "ggsel",
+                "label": "GGsel",
+                "credentials": {"platform": "ggsel", "api_key": "key", "seller_id": "1"},
+            }
+        }
+    )
+    ref = _result(app, await _call(app, Command.ADD_ACCOUNT, params), Command.ADD_ACCOUNT)
+    removed = RemoveAccountParams(account_id=ref.account_id)
+    _result(app, await _call(app, Command.REMOVE_ACCOUNT, removed), Command.REMOVE_ACCOUNT)
+    assert ref.account_id in app.sessions.stopped  # type: ignore[attr-defined]
+    assert await app.storage.get_account(ref.account_id) is None
+
+
+async def test_install_plugin_without_start(app: WorkerApp) -> None:
+    params = InstallPluginParams(archive_b64=base64.b64encode(plugin_zip()).decode(), auto_start=False)
+    state = _result(app, await _call(app, Command.INSTALL_PLUGIN, params), Command.INSTALL_PLUGIN)
+    assert state.id == "test-plugin"
+    assert state.has_config_schema is True
+    assert state.status.value == "stopped"
+    assert (app.config.plugins_dir / "test-plugin" / "plugin.toml").is_file()
+
+
+async def test_set_plugin_config_validates_schema(app: WorkerApp) -> None:
+    install = InstallPluginParams(archive_b64=base64.b64encode(plugin_zip()).decode(), auto_start=False)
+    _result(app, await _call(app, Command.INSTALL_PLUGIN, install), Command.INSTALL_PLUGIN)
+
+    bad = SetPluginConfigParams(plugin_id="test-plugin", config={"greeting": ""})
+    response = await _call(app, Command.SET_PLUGIN_CONFIG, bad)
+    assert response.payload.error is not None
+    assert response.payload.error.code is ErrorCode.INVALID_PARAMS
+
+    good = SetPluginConfigParams(plugin_id="test-plugin", config={"greeting": "Привет"})
+    result = _result(app, await _call(app, Command.SET_PLUGIN_CONFIG, good), Command.SET_PLUGIN_CONFIG)
+    assert result.restart_triggered is False
+
+
+async def test_get_logs(app: WorkerApp) -> None:
+    from lucrium_protocol import LogLevel
+
+    app.logs.add(LogLevel.INFO, "worker", "worker line")
+    app.logs.add(LogLevel.ERROR, "test-plugin", "plugin line")
+    result = _result(app, await _call(app, Command.GET_LOGS, GetLogsParams(scope=LogScope.WORKER)), Command.GET_LOGS)
+    messages = [entry.message for entry in result.entries]
+    assert "worker line" in messages
+    assert "plugin line" not in messages
+    result = _result(
+        app,
+        await _call(app, Command.GET_LOGS, GetLogsParams(scope=LogScope.PLUGIN, plugin_id="test-plugin")),
+        Command.GET_LOGS,
+    )
+    assert [entry.message for entry in result.entries] == ["plugin line"]
+
+
+async def test_rotate_token(app: WorkerApp) -> None:
+    from lucrium_protocol import RotateTokenParams
+
+    old = app.token
+    result = _result(app, await _call(app, Command.ROTATE_TOKEN, RotateTokenParams()), Command.ROTATE_TOKEN)
+    assert result.token != old
+    assert app.token == result.token
+
+
+async def test_export_import_via_commands(app: WorkerApp) -> None:
+    add = AddAccountParams.model_validate(
+        {
+            "account": {
+                "platform": "playerok",
+                "label": "PlayerOK",
+                "credentials": {"platform": "playerok", "access_token": "po-token"},
+            }
+        }
+    )
+    _result(app, await _call(app, Command.ADD_ACCOUNT, add), Command.ADD_ACCOUNT)
+
+    export = await app.handle_request(build_request(Command.EXPORT_STATE, _export_params("passphrase-123")))
+    exported = _result(app, export, Command.EXPORT_STATE)
+    assert exported.size_bytes > 0
+
+    await app.storage.clear_all()
+    imported = _result(
+        app,
+        await _call(
+            app,
+            Command.IMPORT_STATE,
+            ImportStateParams(
+                blob_b64=exported.blob_b64,
+                passphrase=SecretStr("passphrase-123"),
+                mode=ImportMode.REPLACE,
+            ),
+        ),
+        Command.IMPORT_STATE,
+    )
+    assert imported.accounts == 1
+    assert imported.sessions_started == 1
+    accounts = await app.storage.list_accounts()
+    assert len(accounts) == 1
+    assert accounts[0].platform.value == "playerok"
+    assert accounts[0].credentials.secret_value() == "po-token"
+
+
+def _export_params(passphrase: str) -> Any:
+    from lucrium_protocol import ExportStateParams
+
+    return ExportStateParams(passphrase=SecretStr(passphrase))

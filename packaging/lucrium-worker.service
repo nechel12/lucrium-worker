@@ -1,0 +1,22 @@
+[Unit]
+Description=Lucrium Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lucrium
+Group=lucrium
+WorkingDirectory=/opt/lucrium/lucrium-worker
+ExecStart=/opt/lucrium/lucrium-worker/.venv/bin/lucrium-worker run --config /etc/lucrium/worker.toml
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/lucrium
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

@@ -1,36 +1,97 @@
 # Lucrium Worker
 
-Демон для Linux VPS: держит сессии площадок (FunPay / PlayerOK / GGsel) через `aiosellers`, исполняет плагины, хранит все конфиги. **Воркер — источник истины** в экосистеме Lucrium: панель может быть закрыта — воркер продолжает работать 24/7.
+Демон для Linux VPS: держит сессии FunPay / PlayerOK / GGsel через `aiosellers`,
+исполняет плагины в отдельных процессах и отдаёт панели WSS-канал. **Воркер —
+источник истины**: панель можно закрыть, он продолжает работать 24/7.
 
-> **Статус:** скелет. Репозиторий создан, реализация — по дорожной карте ниже.
+## Установка
 
-## Что это
+```bash
+curl -fsSL https://raw.githubusercontent.com/nechel12/lucrium-worker/main/install.sh | bash
+```
 
-- **Установка одной командой:** `curl -fsSL …/install.sh | bash` → Python 3.12+, venv, systemd-юнит, генерация pairing-токена, печать `IP:PORT + токен`.
-- **WSS-сервер для панели** (порт 8443 по умолчанию): bearer-токен, rate-limit на перебор, heartbeat, снапшот состояния при подключении.
-- **Сессии площадок:** `SellerHub` из `aiosellers`, нормализованный поток `HubEvent` → в панель.
-- **Host плагинов:** один subprocess на плагин, IPC JSON-RPC, таймауты, RLIMIT, авто-restart с backoff. Крах плагина не влияет на воркер.
-- **SQLite (WAL)** — аккаунты (креды шифрованы Fernet at-rest), прокси, плагины и их конфиги, KV storage плагинов, история событий.
-- **Экспорт/импорт состояния** в один зашифрованный файл (потеря VPS ≠ потеря настроек).
+Скрипт ставит Python 3.12+, `uv`, systemd-юнит, генерирует pairing-токен и
+(по умолчанию) самоподписанный TLS-сертификат, затем печатает `адрес + токен`.
+Токен показывается один раз — сохраните его.
 
-## Стек
+Переменные: `LUCRIUM_PORT` (8443), `LUCRIUM_DATA_DIR` (`/var/lib/lucrium`),
+`LUCRIUM_TLS=0` (отключить TLS), `LUCRIUM_REPO_URL`, `LUCRIUM_PROTOCOL_URL`.
 
-Python 3.12+, asyncio, `aiosellers` (пинить версию/коммит), SQLite, Pydantic v2 (модели — только из [`lucrium-protocol`](../lucrium-protocol)).
+## CLI
 
-## Дорожная карта (v1)
+```bash
+lucrium-worker init --config /etc/lucrium/worker.toml --data-dir /var/lib/lucrium
+lucrium-worker show-token --config /etc/lucrium/worker.toml
+lucrium-worker run --config /etc/lucrium/worker.toml
+```
 
-- [ ] `install.sh` + systemd-юнит + генерация pairing-токена
-- [ ] WSS-сервер протокола (envelope `{type, id, ts, payload}`, команды/события из `lucrium-protocol`)
-- [ ] StateStore: SQLite (WAL), шифрование кредов, ретеншн истории
-- [ ] Хост сессий: `SellerHub`, capability-матрица, стрим `HubEvent`/`status`
-- [ ] Хост плагинов: subprocess + JSON-RPC IPC, лимиты, restart, live-логи
-- [ ] Установка zip-плагинов с валидацией манифеста `plugin.toml`
-- [ ] Экспорт/импорт состояния (шифрование паролем)
-- [ ] Опционально: Docker-вариант, автообновление (v1.5)
+`init` создаёт конфиг (0600) и pairing-токен (256 бит). Конфиг:
+
+```toml
+[worker]
+host = "0.0.0.0"
+port = 8443
+token = "<64 hex>"
+
+[storage]
+data_dir = "/var/lib/lucrium"
+
+[tls]                       # опционально
+certfile = "/etc/lucrium/tls/cert.pem"
+keyfile = "/etc/lucrium/tls/key.pem"
+
+[heartbeat]
+seconds = 15
+```
+
+## Что внутри
+
+| Модуль | Назначение |
+|---|---|
+| `config` | TOML-конфиг, генерация токена, каталоги данных |
+| `storage` | SQLite (WAL): аккаунты (креды шифруются Fernet at-rest), плагины, KV плагинов |
+| `accounts` | CRUD аккаунтов + capability-матрица площадки |
+| `sessions` | по одному клиенту aiosellers на аккаунт, авто-restart с backoff |
+| `plugins.installer` | установка zip-архивом: zip-slip/zip-bomb защита, валидация `plugin.toml` и JSON-схемы |
+| `plugins.host` | subprocess на плагин, JSON-RPC IPC (unix socket, NDJSON), таймауты, авто-restart |
+| `plugins.rpc` | host-сторона JSON-RPC 2.0 |
+| `server` | WSS-сервер панели: bearer-токен, rate-limit по IP, envelope-цикл |
+| `app` | команды панели, снапшоты состояния, события, heartbeat |
+| `export` | экспорт/импорт состояния (`.lcs`, PBKDF2 + Fernet) |
+
+Протокол и модели — из [`lucrium-protocol`](../lucrium-protocol); SDK плагинов —
+[`lucrium-plugin-sdk`](../lucrium-protocol/packages/lucrium-plugin-sdk).
 
 ## Безопасность
 
-Креды никогда не логируются. Pairing-токен 128+ бит с ротацией и rate-limit. Воркер слушает публичный порт — минимум запросов до аутентификации, опционально TLS. Плагины изолированы процессами и permissions из манифеста.
+- Pairing-токен — bearer на WSS-рукопожатие; неверные попытки блокируют IP с
+  экспоненциальным backoff.
+- Креды площадок шифруются at-rest ключом `data_dir/secret.key` (0600).
+- `get_state` — единственный ответ с кредами; событие `state` их не содержит.
+- Плагин не имеет доступа к сети без `permissions.network = true`; площадки —
+  только через `ctx.session`.
+- TLS: самоподписанный сертификат или сертификат домена пользователя.
+
+## Разработка
+
+Репозитории должны лежать рядом (`lucrium-worker` и `lucrium-protocol`):
+
+```bash
+uv sync
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src
+uv run pytest
+```
+
+Тест `tests/test_plugin_host.py` запускает реальный subprocess плагина через
+unix socket — только Linux (на Windows пропускается).
+
+## Статус
+
+v1 (рабочее ядро): WSS-сервер, аккаунты/сессии, host плагинов, установка zip,
+SQLite, экспорт/импорт, `install.sh` + systemd. Дальше: Docker-образ,
+телеметрия/метрики, удалённая доставка плагинов (v2, формат уже в protocol).
 
 ## Лицензия
 
