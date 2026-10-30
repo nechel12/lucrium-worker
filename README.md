@@ -19,7 +19,8 @@ curl -fsSL https://raw.githubusercontent.com/nechel12/lucrium-worker/main/instal
 `main`), `LUCRIUM_REPO_URL`, `LUCRIUM_PROTOCOL_URL`. Для воспроизводимой
 установки задавайте подписанный `LUCRIUM_REF=vX.Y.Z`; для `v*` installer
 проверяет SSH-подпись тега. Только для разработки можно отключить проверку:
-`LUCRIUM_ALLOW_UNSIGNED_TAGS=1`.
+`LUCRIUM_ALLOW_UNSIGNED_TAGS=1`. Теги, созданные до введения подписи, не
+считаются доверенными — используйте ближайший подписанный релиз.
 
 При TLS установщик печатает SHA256 fingerprint самоподписанного сертификата.
 Его нужно вставить в панели: проверка TLS включена по умолчанию, а fingerprint
