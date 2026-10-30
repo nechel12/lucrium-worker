@@ -31,7 +31,9 @@ from .server import PanelServer
 
 def main(argv: list[str] | None = None) -> int:
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="путь к worker.toml")
+    # SUPPRESS обязателен: иначе default у subparser'а перетирает --config,
+    # переданный до подкоманды.
+    common.add_argument("--config", default=argparse.SUPPRESS, help="путь к worker.toml")
 
     parser = argparse.ArgumentParser(
         prog="lucrium-worker", description="Lucrium Worker — демон панели", parents=[common]
@@ -51,6 +53,8 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("run", help="запустить демон (по умолчанию)", parents=[common])
 
     args = parser.parse_args(argv)
+    if not hasattr(args, "config"):
+        args.config = str(DEFAULT_CONFIG_PATH)
     command = args.command or "run"
     try:
         if command == "init":
@@ -109,8 +113,13 @@ def _run(path: Path) -> int:
 async def _serve(config: WorkerConfig, path: Path) -> None:
     app = WorkerApp(config, config_path=path)
     server = PanelServer(config, app, app.logs)
-    await app.start()
-    await server.start()
+    try:
+        await app.start()
+        await server.start()
+    except BaseException:
+        await server.stop()
+        await app.stop()
+        raise
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()

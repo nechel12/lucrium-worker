@@ -148,12 +148,15 @@ class SessionManager:
 
     async def call(self, session_id: str | None, method: str, params: dict[str, Any]) -> Any:
         """Вызов метода клиента aiosellers через dotted-путь (``chats.send_message``)."""
-        root = method.split(".", 1)[0]
+        parts = method.split(".")
+        root = parts[0]
         if root not in ALLOWED_CLIENT_ROOTS:
             raise SessionError(f"method {method!r} is not allowed")
+        if any(part.startswith("_") or part in {"client", "transport", "raw"} for part in parts[1:]):
+            raise SessionError(f"private client path {method!r} is not allowed")
         runtime = self.resolve(session_id)
         target: Any = runtime.client
-        for part in method.split("."):
+        for part in parts:
             target = getattr(target, part)
         if not callable(target):
             raise SessionError(f"{method!r} is not callable on {runtime.platform.value} client")
@@ -166,10 +169,15 @@ class SessionManager:
 
     async def start(self, record: AccountRecord) -> SessionRuntime:
         runtime = self._runtimes.get(record.id)
-        if runtime is not None and runtime.status in {SessionStatus.RUNNING, SessionStatus.STARTING}:
+        if (
+            runtime is not None
+            and runtime.status in {SessionStatus.RUNNING, SessionStatus.STARTING}
+            and runtime.task is not None
+            and not runtime.task.done()
+        ):
             return runtime
         if runtime is not None:
-            # ERROR/STOPPED: сначала гасим прежнюю задачу, чтобы не было двух сессий
+            # ERROR/STOPPED/умершая задача: гасим прежнюю, чтобы не было двух сессий
             await self.stop(record.id)
         runtime = SessionRuntime(account_id=record.id, platform=record.platform)
         self._runtimes[record.id] = runtime
@@ -185,8 +193,16 @@ class SessionManager:
         task = runtime.task
         if task is not None:
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            try:
                 await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                self._logs.add(
+                    LogLevel.WARNING,
+                    "worker",
+                    f"session {account_id} task failed during stop: {type(exc).__name__}: {exc}"[:2000],
+                )
         runtime.status = SessionStatus.STOPPED
         self._runtimes.pop(account_id, None)
 
@@ -198,11 +214,12 @@ class SessionManager:
     async def _supervise(self, record: AccountRecord, runtime: SessionRuntime) -> None:
         backoff = BACKOFF_START
         while not runtime.stopping:
-            state = SQLiteStateStore(self._data_dir / "sessions" / f"{record.id}.db")
-            runtime.state_store = state
-            runtime.status = SessionStatus.STARTING
+            state: SQLiteStateStore | None = None
             hub = SellerHub()
             try:
+                state = SQLiteStateStore(self._data_dir / "sessions" / f"{record.id}.db")
+                runtime.state_store = state
+                runtime.status = SessionStatus.STARTING
                 client = build_client(record, state)
                 runtime.client = client
                 hub.add(client, platform=record.platform.value, session_id=record.id)
@@ -216,11 +233,12 @@ class SessionManager:
                 async for event in hub.stream():
                     runtime.last_event_at = datetime.now(UTC)
                     await self._on_event(hub_event_to_protocol(event))
+                raise SessionError("platform event stream ended unexpectedly")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 runtime.status = SessionStatus.ERROR
-                runtime.last_error = f"{type(exc).__name__}: {exc}"
+                runtime.last_error = f"{type(exc).__name__}: {exc}"[:2000]
                 runtime.restarts += 1
                 self._logs.add(
                     LogLevel.ERROR,
@@ -232,8 +250,9 @@ class SessionManager:
                 runtime.client = None
                 with contextlib.suppress(Exception):
                     await hub.close()
-                with contextlib.suppress(Exception):
-                    await state.close()
+                if state is not None:
+                    with contextlib.suppress(Exception):
+                        await state.close()
                 runtime.state_store = None
             if runtime.stopping:
                 break

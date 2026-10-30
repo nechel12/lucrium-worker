@@ -72,7 +72,9 @@ async def test_plugin_subprocess_lifecycle(tmp_path: Path) -> None:
         await _wait_until(lambda: _has_log(logs, record.id, "got message"), timeout=10)
 
         started = _logs(logs, record.id)
-        assert any("test plugin started" in entry.message for entry in started)
+        started_entry = next(entry for entry in started if "test plugin started" in entry.message)
+        assert started_entry.fields["greeting"] == "Привет"
+        assert started_entry.fields["big"] == 200_000
         assert any("got message" in entry.message for entry in started)
     finally:
         await host.stop(record.id)

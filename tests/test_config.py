@@ -70,6 +70,32 @@ def test_invalid_port_rejected(tmp_path: Path) -> None:
         WorkerConfig(data_dir=tmp_path, token="a" * 64, port=70000)
 
 
+def test_non_hex_token_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError):
+        WorkerConfig(data_dir=tmp_path, token="z" * 64)
+
+
+def test_non_finite_heartbeat_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError):
+        WorkerConfig(data_dir=tmp_path, token="a" * 64, heartbeat_seconds=float("nan"))
+
+
+def test_cli_config_before_subcommand_is_used(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from lucrium_worker.__main__ import main
+
+    config = create_config(data_dir=tmp_path / "data", host="127.0.0.1", port=9443)
+    path = config.save(tmp_path / "custom.toml")
+    assert main(["--config", str(path), "show-token"]) == 0
+    assert config.token in capsys.readouterr().out
+
+
+def test_tls_table_must_be_a_table(tmp_path: Path) -> None:
+    path = tmp_path / "worker.toml"
+    path.write_text('tls = "not a table"\n[worker]\ntoken = "' + "a" * 64 + '"\n', encoding="utf-8")
+    with pytest.raises(ConfigError, match="tls"):
+        WorkerConfig.load(path)
+
+
 def test_missing_config(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="not found"):
         WorkerConfig.load(tmp_path / "missing.toml")

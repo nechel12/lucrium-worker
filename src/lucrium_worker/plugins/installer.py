@@ -7,15 +7,20 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import uuid
 import zipfile
+import zlib
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 
+import jsonschema
 from lucrium_plugin_sdk.manifest import ConfigSchemaError, load_config_schema
 from lucrium_protocol.manifest import MANIFEST_FILENAME, ManifestError, PluginManifest, parse_manifest_text
+
+_PLUGIN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{2,63}$")
 
 MAX_ARCHIVE_BYTES = 48 * 1024 * 1024
 MAX_UNCOMPRESSED_BYTES = 128 * 1024 * 1024
@@ -41,7 +46,20 @@ class PluginInstaller:
         return self._plugins_dir
 
     def directory_for(self, plugin_id: str) -> Path:
+        validate_plugin_id(plugin_id)
         return self._plugins_dir / plugin_id
+
+    def inspect(self, archive: bytes) -> PluginManifest:
+        """Читает и валидирует манифест архива, не распаковывая его."""
+        if len(archive) > MAX_ARCHIVE_BYTES:
+            raise InstallError(f"archive exceeds {MAX_ARCHIVE_BYTES} bytes")
+        try:
+            with zipfile.ZipFile(BytesIO(archive)) as zf:
+                members = _safe_members(zf)
+                root = _find_plugin_root(members)
+                return _read_manifest(zf, members, root)
+        except (zipfile.BadZipFile, OSError, zlib.error) as exc:
+            raise InstallError(f"not a valid zip archive: {exc}") from exc
 
     def install(self, archive: bytes, *, overwrite: bool = False) -> InstalledPlugin:
         if len(archive) > MAX_ARCHIVE_BYTES:
@@ -57,8 +75,10 @@ class PluginInstaller:
                 staging = self._plugins_dir / f".staging-{uuid.uuid4().hex}"
                 try:
                     self._extract(zf, members, root, staging)
-                    load_config_schema(staging, manifest)
-                except (ManifestError, ConfigSchemaError) as exc:
+                    schema = load_config_schema(staging, manifest)
+                    if schema is not None:
+                        jsonschema.Draft202012Validator.check_schema(schema)
+                except (ManifestError, ConfigSchemaError, jsonschema.SchemaError) as exc:
                     shutil.rmtree(staging, ignore_errors=True)
                     raise InstallError(str(exc)) from exc
                 except BaseException:
@@ -68,8 +88,8 @@ class PluginInstaller:
                     shutil.rmtree(target)
                 staging.rename(target)
                 return InstalledPlugin(manifest=manifest, directory=target)
-        except zipfile.BadZipFile as exc:
-            raise InstallError(f"not a zip archive: {exc}") from exc
+        except (zipfile.BadZipFile, OSError, zlib.error) as exc:
+            raise InstallError(f"not a valid zip archive: {exc}") from exc
 
     def remove(self, plugin_id: str) -> None:
         directory = self.directory_for(plugin_id)
@@ -165,7 +185,15 @@ def _relative_name(info: zipfile.ZipInfo, root: str) -> Path | None:
         name = name[len(prefix) :]
     if not name:
         return None
-    return Path(*PurePosixPath(name).parts)
+    parts = PurePosixPath(name).parts
+    if not parts or parts in {(".",)} or any(part in {"", ".", ".."} for part in parts):
+        return None
+    return Path(*parts)
+
+
+def validate_plugin_id(plugin_id: str) -> None:
+    if not _PLUGIN_ID_RE.fullmatch(plugin_id):
+        raise InstallError(f"unsafe plugin id: {plugin_id!r}")
 
 
 __all__ = [
@@ -175,4 +203,5 @@ __all__ = [
     "InstallError",
     "InstalledPlugin",
     "PluginInstaller",
+    "validate_plugin_id",
 ]

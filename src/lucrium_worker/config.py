@@ -21,7 +21,9 @@
 from __future__ import annotations
 
 import contextlib
+import math
 import os
+import re
 import secrets
 import tomllib
 from dataclasses import dataclass, field, replace
@@ -58,10 +60,10 @@ class WorkerConfig:
     def __post_init__(self) -> None:
         if not 1 <= self.port <= 65535:
             raise ConfigError(f"port out of range: {self.port}")
-        if len(self.token) < 32:
-            raise ConfigError("pairing token must be at least 32 characters (128+ bits)")
-        if self.heartbeat_seconds <= 0:
-            raise ConfigError("heartbeat.seconds must be positive")
+        if not re.fullmatch(r"[0-9a-fA-F]{32,128}", self.token):
+            raise ConfigError("pairing token must be 32-128 hex characters (128+ bits)")
+        if not math.isfinite(self.heartbeat_seconds) or self.heartbeat_seconds <= 0:
+            raise ConfigError("heartbeat.seconds must be a positive finite number")
         if self.event_retention_days <= 0:
             raise ConfigError("storage.event_retention_days must be positive")
         if self.plugin_memory_limit_mb <= 0:
@@ -108,6 +110,8 @@ class WorkerConfig:
 
         data_dir = Path(os.environ.get("LUCRIUM_DATA_DIR", str(storage.get("data_dir", DEFAULT_DATA_DIR))))
         tls: TlsConfig | None = None
+        if tls_raw is not None and not isinstance(tls_raw, dict):
+            raise ConfigError("[tls] must be a table")
         if isinstance(tls_raw, dict):
             certfile = tls_raw.get("certfile")
             keyfile = tls_raw.get("keyfile")
@@ -135,6 +139,7 @@ class WorkerConfig:
         """Пишет конфиг с правами 0600 (в нём pairing-токен)."""
         file = Path(path)
         file.parent.mkdir(parents=True, exist_ok=True)
+        temp = file.with_name(f".{file.name}.tmp")
         lines = [
             "[worker]",
             f'host = "{self.host}"',
@@ -159,7 +164,9 @@ class WorkerConfig:
                 f'certfile = "{self.tls.certfile.as_posix()}"',
                 f'keyfile = "{self.tls.keyfile.as_posix()}"',
             ]
-        file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        temp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        _chmod_600(temp)
+        os.replace(temp, file)
         _chmod_600(file)
         return file
 
@@ -182,6 +189,8 @@ def create_config(
 def ensure_directories(config: WorkerConfig) -> None:
     for directory in (config.data_dir, config.plugins_dir, config.plugin_data_dir, config.logs_dir):
         directory.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            directory.chmod(0o700)
 
 
 def _table(raw: dict[str, object], name: str) -> dict[str, object]:

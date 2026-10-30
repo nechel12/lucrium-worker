@@ -23,6 +23,7 @@ def free_port() -> int:
 
 def test_token_auth_rate_limit() -> None:
     auth = TokenAuth(lambda: "secret-token", max_failures=3, base_delay=10.0)
+    assert auth.check("1.1.1.1", "токен") is False  # non-ASCII не должен бросать TypeError
     assert auth.check("1.1.1.1", "secret-token") is True
     for _ in range(3):
         assert auth.check("1.1.1.1", "wrong") is False

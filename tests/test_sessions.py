@@ -59,6 +59,10 @@ async def test_private_and_unknown_roots_rejected(manager: SessionManager) -> No
         await manager.call("acc-1", "_require", {})
     with pytest.raises(SessionError, match="not allowed"):
         await manager.call("acc-1", "__class__", {})
+    with pytest.raises(SessionError, match="private"):
+        await manager.call("acc-1", "chats._client", {})
+    with pytest.raises(SessionError, match="private"):
+        await manager.call("acc-1", "chats._client._transport.request", {})
 
 
 async def test_non_callable_method_rejected(manager: SessionManager) -> None:

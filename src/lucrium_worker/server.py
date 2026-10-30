@@ -31,7 +31,7 @@ from .app import WorkerApp
 from .config import WorkerConfig
 from .logs import LogBuffer
 
-MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+MAX_MESSAGE_BYTES = 80 * 1024 * 1024
 
 
 class TokenAuth:
@@ -58,7 +58,7 @@ class TokenAuth:
         if until is not None and until > now:
             return False
         expected = self._token_getter()
-        if token is not None and hmac.compare_digest(token, expected):
+        if token is not None and hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8")):
             self._failures.pop(ip, None)
             self._blocked_until.pop(ip, None)
             return True
@@ -78,6 +78,7 @@ class PanelServer:
         self._clients: set[ServerConnection] = set()
         self._server: Any = None
         self._auth = TokenAuth(lambda: self._app.token)
+        self._background: set[asyncio.Task[None]] = set()
 
     async def start(self) -> None:
         ssl_context = _ssl_context(self._config)
@@ -100,6 +101,11 @@ class PanelServer:
         )
 
     async def stop(self) -> None:
+        for task in list(self._background):
+            task.cancel()
+        if self._background:
+            await asyncio.gather(*self._background, return_exceptions=True)
+        self._background.clear()
         for client in list(self._clients):
             with contextlib.suppress(Exception):
                 await client.close(code=1001, reason="worker shutting down")
@@ -114,11 +120,12 @@ class PanelServer:
         if not self._clients:
             return
         payload = event.model_dump_json()
+        clients = list(self._clients)
         results = await asyncio.gather(
-            *(client.send(payload) for client in list(self._clients)),
+            *(client.send(payload) for client in clients),
             return_exceptions=True,
         )
-        for client, result in zip(list(self._clients), results, strict=False):
+        for client, result in zip(clients, results, strict=True):
             if isinstance(result, BaseException):
                 self._clients.discard(client)
 
@@ -160,6 +167,19 @@ class PanelServer:
             return
         response = await self._app.handle_request(envelope)
         await connection.send(response.model_dump_json())
+        if envelope.payload.method == "rotate_token" and response.payload.error is None:
+            # Даём ответу уйти, затем рвём все соединения: старый токен отозван.
+            task = asyncio.create_task(self._close_all_after_rotate(), name="worker-close-after-rotate")
+            self._background.add(task)
+            task.add_done_callback(self._background.discard)
+
+    async def _close_all_after_rotate(self) -> None:
+        await asyncio.sleep(0.05)
+        for client in list(self._clients):
+            self._clients.discard(client)
+            with contextlib.suppress(Exception):
+                await client.close(code=1001, reason="pairing token rotated")
+        self._app.connected_panels = len(self._clients)
 
 
 def _bearer(headers: Headers) -> str | None:

@@ -17,6 +17,7 @@ from typing import Any
 from lucrium_protocol.ipc import RpcError, RpcErrorCode, RpcNotification, RpcRequest, RpcResponse
 
 MAX_LINE_BYTES = 16 * 1024 * 1024
+MAX_CONCURRENT_REQUESTS = 64
 DEFAULT_TIMEOUT = 30.0
 
 RequestHandler = Callable[[str, dict[str, Any]], Awaitable[Any]]
@@ -143,6 +144,8 @@ class RpcPeer:
             raise IpcError("plugin message must be a JSON object")
 
         if "method" in data:
+            if len(self._tasks) >= MAX_CONCURRENT_REQUESTS:
+                raise IpcError("too many concurrent requests from plugin")
             if "id" in data:
                 request = RpcRequest.model_validate(data)
                 self._spawn(self._handle_request(request), f"lucrium-rpc-{request.method}")
@@ -201,6 +204,7 @@ class RpcPeer:
 
 __all__ = [
     "DEFAULT_TIMEOUT",
+    "MAX_CONCURRENT_REQUESTS",
     "MAX_LINE_BYTES",
     "IpcError",
     "PluginRpcError",

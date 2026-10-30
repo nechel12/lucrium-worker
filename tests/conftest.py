@@ -90,7 +90,7 @@ def make_account(
     elif platform is Platform.PLAYEROK:
         credentials = AccountCredentials(platform=platform, access_token=SecretStr("po-secret-value"))
     else:
-        credentials = AccountCredentials(platform=platform, api_key=SecretStr("gg-secret-value"), seller_id="seller-1")
+        credentials = AccountCredentials(platform=platform, api_key=SecretStr("gg-secret-value"), seller_id="1")
     return AccountRecord(
         id=account_id,
         platform=platform,
@@ -140,7 +140,10 @@ from lucrium_plugin_sdk import PluginContext, PluginEvent
 
 
 async def on_start(ctx: PluginContext) -> None:
-    ctx.log.info("test plugin started", greeting=ctx.config.get("greeting"))
+    # >64 KiB: регрессия на host-side asyncio limit в NDJSON IPC.
+    await ctx.storage.set("big", "x" * 200_000)
+    size = len(await ctx.storage.get("big", ""))
+    ctx.log.info("test plugin started", greeting=ctx.config.get("greeting"), big=size)
 
 
 async def on_event(event: PluginEvent, ctx: PluginContext) -> None:

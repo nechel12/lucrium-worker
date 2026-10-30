@@ -6,6 +6,7 @@ import asyncio
 import base64
 import contextlib
 import inspect
+import json
 import os
 import sys
 import urllib.error
@@ -49,13 +50,15 @@ from lucrium_protocol.ipc import (
 from ..logs import LogBuffer
 from ..sessions import SessionError, SessionManager
 from ..storage import PluginRecord, Storage
-from .rpc import IpcError, PluginRpcError, RpcPeer
+from .installer import validate_plugin_id
+from .rpc import MAX_LINE_BYTES, IpcError, PluginRpcError, RpcPeer
 
 START_TIMEOUT = 30.0
 STOP_TIMEOUT = 15.0
 EVENT_TIMEOUT = 30.0
 SESSION_CALL_TIMEOUT = 60.0
 MAX_HTTP_BODY = 8 * 1024 * 1024
+MAX_KV_VALUE_BYTES = 1024 * 1024
 EVENT_QUEUE_SIZE = 1000
 BACKOFF_START = 1.0
 BACKOFF_MAX = 60.0
@@ -89,6 +92,7 @@ class PluginHost:
         self._on_change = on_change
         self._processes: dict[str, _PluginProcess] = {}
         self._restart_tasks: dict[str, asyncio.Task[None]] = {}
+        self._last_errors: dict[str, str] = {}
 
     # --- запросы --------------------------------------------------------------
 
@@ -102,15 +106,26 @@ class PluginHost:
 
     def last_error(self, plugin_id: str) -> str | None:
         process = self._processes.get(plugin_id)
-        return None if process is None else process.last_error
+        if process is not None and process.last_error:
+            return process.last_error[:2000]
+        return self._last_errors.get(plugin_id, "")[:2000] or None
 
     # --- управление -----------------------------------------------------------
 
     async def start(self, record: PluginRecord) -> None:
         if record.id in self._processes:
             return
+        try:
+            validate_plugin_id(record.id)
+        except Exception as exc:
+            self._last_errors[record.id] = f"{type(exc).__name__}: {exc}"[:2000]
+            raise
         directory = self._plugins_dir / record.id
-        manifest = load_manifest(directory)
+        try:
+            manifest = load_manifest(directory)
+        except Exception as exc:
+            self._last_errors[record.id] = f"{type(exc).__name__}: {exc}"[:2000]
+            raise
         process = _PluginProcess(
             record=record,
             manifest=manifest,
@@ -119,7 +134,14 @@ class PluginHost:
             host=self,
         )
         self._processes[record.id] = process
-        await process.start()
+        try:
+            await process.start()
+        except Exception:
+            self._processes.pop(record.id, None)
+            self._last_errors[record.id] = process.last_error or "plugin failed to start"
+            self._notify_change()
+            raise
+        self._last_errors.pop(record.id, None)
         self._notify_change()
 
     async def stop(self, plugin_id: str, *, reason: str = "panel request") -> None:
@@ -131,6 +153,7 @@ class PluginHost:
         process = self._processes.pop(plugin_id, None)
         if process is not None:
             await process.stop(reason=reason)
+        self._last_errors.pop(plugin_id, None)
         self._notify_change()
 
     async def stop_all(self) -> None:
@@ -155,6 +178,7 @@ class PluginHost:
         plugin_id = process.record.id
         if plugin_id in self._restart_tasks or process.stopping:
             return
+        process.last_error = error[:2000]
         process.restarts += 1
         delay = min(BACKOFF_START * (2 ** (process.restarts - 1)), BACKOFF_MAX)
         if self._on_error is not None:
@@ -234,10 +258,14 @@ class _PluginProcess:
         with contextlib.suppress(FileNotFoundError):
             self.socket_path.unlink()
         self._connected = asyncio.get_running_loop().create_future()
-        self._server = await asyncio.start_unix_server(self._on_connection, path=str(self.socket_path))
-        env = os.environ.copy()
-        env[PLUGIN_DIR_ENV] = str(self.directory)
-        env[PLUGIN_SOCKET_ENV] = str(self.socket_path)
+        self._server = await asyncio.start_unix_server(
+            self._on_connection,
+            path=str(self.socket_path),
+            limit=MAX_LINE_BYTES,
+        )
+        with contextlib.suppress(OSError):
+            self.socket_path.chmod(0o600)
+        env = _plugin_env(self.directory, self.socket_path)
         subprocess_kwargs: dict[str, Any] = {}
         if sys.platform != "win32":
             # RLIMIT_AS: плагин не должен съесть память VPS (спека §6.3)
@@ -266,7 +294,7 @@ class _PluginProcess:
                 timeout=START_TIMEOUT,
             )
         except Exception as exc:
-            self.last_error = f"{type(exc).__name__}: {exc}"
+            self.last_error = f"{type(exc).__name__}: {exc}"[:2000]
             await self.cleanup()
             raise RuntimeError(self.last_error) from exc
         self.status = PluginStatus.RUNNING
@@ -349,7 +377,12 @@ class _PluginProcess:
                     {"kind": event.kind.value, "session_id": event.session_id, "code": exc.code},
                 )
             except IpcError as exc:
-                self.host._logs.add(LogLevel.ERROR, self.record.id, f"plugin IPC error: {exc}")
+                message = f"plugin IPC error: {exc}"[:2000]
+                self.host._logs.add(LogLevel.ERROR, self.record.id, message)
+                if not self.stopping:
+                    self.status = PluginStatus.CRASHED
+                    self.last_error = message
+                    self.host._schedule_restart(self, message)
                 return
 
     # --- IPC ------------------------------------------------------------------
@@ -368,7 +401,12 @@ class _PluginProcess:
         if method == STORAGE_GET:
             return {"value": await storage.kv_get(plugin_id, str(params["key"]))}
         if method == STORAGE_SET:
-            await storage.kv_set(plugin_id, str(params["key"]), params.get("value"))
+            value = params.get("value")
+            if len(json.dumps(value, ensure_ascii=False).encode("utf-8")) > MAX_KV_VALUE_BYTES:
+                raise PluginRpcError(
+                    _rpc_error(RpcErrorCode.INVALID_PARAMS, f"KV value exceeds {MAX_KV_VALUE_BYTES} bytes")
+                )
+            await storage.kv_set(plugin_id, str(params["key"]), value)
             return {}
         if method == STORAGE_DELETE:
             await storage.kv_delete(plugin_id, str(params["key"]))
@@ -418,7 +456,10 @@ class _PluginProcess:
         if stream is None:
             return
         while True:
-            raw = await stream.readline()
+            try:
+                raw = await stream.readline()
+            except (ValueError, OSError):
+                return
             if not raw:
                 return
             text = raw.decode("utf-8", errors="replace").rstrip()
@@ -437,6 +478,32 @@ class _PluginProcess:
         self.host._schedule_restart(self, self.last_error)
 
 
+def _plugin_env(directory: Path, socket_path: Path) -> dict[str, str]:
+    """Минимальное окружение: не отдаём плагину токены/секреты воркера."""
+    allowed_exact = {
+        "PATH",
+        "HOME",
+        "LANG",
+        "LANGUAGE",
+        "TZ",
+        "PYTHONUNBUFFERED",
+        "PYTHONIOENCODING",
+        "PYTHONPATH",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "ALL_PROXY",
+    }
+    env = {key: value for key, value in os.environ.items() if key in allowed_exact or key.startswith(("LC_", "PYTHON"))}
+    env[PLUGIN_DIR_ENV] = str(directory)
+    env[PLUGIN_SOCKET_ENV] = str(socket_path)
+    return env
+
+
 def _rpc_error(code: int, message: str) -> RpcError:
     return RpcError(code=code, message=message)
 
@@ -453,7 +520,10 @@ def _memory_limiter(limit_bytes: int) -> Callable[[], None]:
 
 
 def _http_request_sync(params: HttpRequestParams) -> HttpResponseResult:
-    body = base64.b64decode(params.body_b64) if params.body_b64 else None
+    try:
+        body = base64.b64decode(params.body_b64, validate=True) if params.body_b64 else None
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"body_b64 is not valid base64: {exc}") from exc
     request = urllib.request.Request(params.url, data=body, method=params.method, headers=params.headers)
     try:
         with urllib.request.urlopen(request, timeout=params.timeout_seconds) as response:
