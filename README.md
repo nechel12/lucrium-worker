@@ -15,7 +15,13 @@ curl -fsSL https://raw.githubusercontent.com/nechel12/lucrium-worker/main/instal
 Токен показывается один раз — сохраните его.
 
 Переменные: `LUCRIUM_PORT` (8443), `LUCRIUM_DATA_DIR` (`/var/lib/lucrium`),
-`LUCRIUM_TLS=0` (отключить TLS), `LUCRIUM_REPO_URL`, `LUCRIUM_PROTOCOL_URL`.
+`LUCRIUM_TLS=0` (отключить TLS), `LUCRIUM_REF` (тег/коммит, по умолчанию
+`main`), `LUCRIUM_REPO_URL`, `LUCRIUM_PROTOCOL_URL`. Для воспроизводимой
+установки задавайте `LUCRIUM_REF=vX.Y.Z`.
+
+При TLS установщик печатает SHA256 fingerprint самоподписанного сертификата.
+Его нужно вставить в панели: проверка TLS включена по умолчанию, а fingerprint
+даёт защиту от MITM без отключения проверки.
 
 ## CLI
 
@@ -64,7 +70,7 @@ memory_limit_mb = 512       # RLIMIT_AS для процесса плагина
 | `plugins.rpc` | host-сторона JSON-RPC 2.0 |
 | `server` | WSS-сервер панели: bearer-токен, rate-limit по IP, envelope-цикл |
 | `app` | команды панели, снапшоты состояния, события, heartbeat |
-| `export` | экспорт/импорт состояния (`.lcs`, PBKDF2 + Fernet) |
+| `export` | экспорт/импорт состояния (`.lcs`, PBKDF2-SHA256 600k + Fernet): аккаунты/прокси, плагины, KV, артефакты плагинов и опционально история |
 
 Протокол и модели — из [`lucrium-protocol`](../lucrium-protocol); SDK плагинов —
 [`lucrium-plugin-sdk`](../lucrium-protocol/packages/lucrium-plugin-sdk).
@@ -73,11 +79,17 @@ memory_limit_mb = 512       # RLIMIT_AS для процесса плагина
 
 - Pairing-токен — bearer на WSS-рукопожатие; неверные попытки блокируют IP с
   экспоненциальным backoff.
-- Креды площадок шифруются at-rest ключом `data_dir/secret.key` (0600).
-- `get_state` — единственный ответ с кредами; событие `state` их не содержит.
-- Плагин не имеет доступа к сети без `permissions.network = true`; площадки —
-  только через `ctx.session`.
-- TLS: самоподписанный сертификат или сертификат домена пользователя.
+- Креды площадок, пароли прокси, конфиги и KV плагинов шифруются at-rest ключом
+  `data_dir/secret.key` (0600); data dir — `0700`, БД/логи — `0600`.
+- `get_state` — единственный ответ с кредами; событие `state` их не содержит,
+  конфиги плагинов в broadcast не попадают.
+- TLS: самоподписанный сертификат или сертификат домена пользователя. Панель
+  проверяет TLS по умолчанию; для self-signed используйте fingerprint.
+- **Плагины — доверенный код.** `permissions.network` ограничивает только
+  `ctx.http`, но не ОС: плагин запускается от того же пользователя и может
+  читать файлы воркера (включая `secret.key`) и открывать сокеты напрямую.
+  Устанавливайте только проверенные плагины; полноценная песочница — отдельная
+  задача (per-plugin user/namespace).
 
 ## Разработка
 

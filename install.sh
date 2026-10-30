@@ -22,6 +22,8 @@ TLS_ENABLED="${LUCRIUM_TLS:-1}"
 PYTHON_VERSION="${LUCRIUM_PYTHON:-3.12}"
 WORKER_URL="${LUCRIUM_REPO_URL:-https://github.com/nechel12/lucrium-worker.git}"
 PROTOCOL_URL="${LUCRIUM_PROTOCOL_URL:-https://github.com/nechel12/lucrium-protocol.git}"
+# Для воспроизводимой установки укажите тег/коммит: LUCRIUM_REF=v1.2.3
+REF="${LUCRIUM_REF:-main}"
 CONFIG_FILE="$CONFIG_DIR/worker.toml"
 
 log() { printf '\033[1;34m[lucrium]\033[0m %s\n' "$*"; }
@@ -46,6 +48,10 @@ install_packages() {
 
 install_packages
 
+# Публичный адрес нужен и для SAN сертификата, и для итогового вывода.
+IP="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
+[ -n "$IP" ] || IP="SERVER_IP"
+
 if ! command -v uv >/dev/null; then
   log "installing uv"
   curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh >/dev/null
@@ -66,12 +72,12 @@ mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR"
 clone_or_update() {
   local url="$1" target="$2"
   if [ -d "$target/.git" ]; then
-    log "updating $(basename "$target")"
-    git -C "$target" fetch --quiet origin
-    git -C "$target" reset --hard --quiet origin/main
+    log "updating $(basename "$target") to $REF"
+    git -C "$target" fetch --quiet --depth 1 origin "$REF"
+    git -C "$target" reset --hard --quiet FETCH_HEAD
   else
-    log "cloning $(basename "$target")"
-    git clone --quiet --depth 1 "$url" "$target"
+    log "cloning $(basename "$target") @ $REF"
+    git clone --quiet --depth 1 --branch "$REF" "$url" "$target"
   fi
 }
 
@@ -84,6 +90,7 @@ log "syncing python environment"
 WORKER_BIN="$INSTALL_DIR/lucrium-worker/.venv/bin/lucrium-worker"
 [ -x "$WORKER_BIN" ] || die "worker entrypoint not found: $WORKER_BIN"
 
+FINGERPRINT=""
 FRESH=0
 if [ ! -f "$CONFIG_FILE" ]; then
   FRESH=1
@@ -91,16 +98,38 @@ if [ ! -f "$CONFIG_FILE" ]; then
   if [ "$TLS_ENABLED" = "1" ] && command -v openssl >/dev/null; then
     log "generating self-signed TLS certificate"
     mkdir -p "$CONFIG_DIR/tls"
-    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=lucrium" \
-      -keyout "$CONFIG_DIR/tls/key.pem" -out "$CONFIG_DIR/tls/cert.pem" >/dev/null 2>&1
+    SAN="DNS:localhost,IP:127.0.0.1"
+    if [ "$IP" != "SERVER_IP" ]; then
+      if printf '%s' "$IP" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$|^[0-9a-fA-F:]+$'; then
+        SAN="$SAN,IP:$IP"
+      else
+        SAN="$SAN,DNS:$IP"
+      fi
+    fi
+    # -addext есть не во всех старых OpenSSL; без SAN сертификат всё равно
+    # можно закрепить через fingerprint.
+    if ! openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=lucrium" \
+      -addext "subjectAltName=$SAN" \
+      -keyout "$CONFIG_DIR/tls/key.pem" -out "$CONFIG_DIR/tls/cert.pem" >/dev/null 2>&1; then
+      openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=lucrium" \
+        -keyout "$CONFIG_DIR/tls/key.pem" -out "$CONFIG_DIR/tls/cert.pem" >/dev/null 2>&1
+    fi
     chmod 600 "$CONFIG_DIR/tls/key.pem"
+    FINGERPRINT="$(openssl x509 -in "$CONFIG_DIR/tls/cert.pem" -noout -fingerprint -sha256 \
+      | sed 's/^.*=//; s/://g' | tr 'A-F' 'a-f')"
     TLS_ARGS=(--tls-cert "$CONFIG_DIR/tls/cert.pem" --tls-key "$CONFIG_DIR/tls/key.pem")
   fi
   log "generating config and pairing token"
   "$WORKER_BIN" init --config "$CONFIG_FILE" --data-dir "$DATA_DIR" --port "$PORT" "${TLS_ARGS[@]}" >/dev/null
 fi
 
+if [ -z "$FINGERPRINT" ] && [ -f "$CONFIG_DIR/tls/cert.pem" ]; then
+  FINGERPRINT="$(openssl x509 -in "$CONFIG_DIR/tls/cert.pem" -noout -fingerprint -sha256 \
+    | sed 's/^.*=//; s/://g' | tr 'A-F' 'a-f')"
+fi
+
 chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"
+chmod 700 "$DATA_DIR"
 chown "$SERVICE_USER:$SERVICE_USER" "$CONFIG_FILE"
 chmod 600 "$CONFIG_FILE"
 if [ -d "$CONFIG_DIR/tls" ]; then
@@ -139,17 +168,25 @@ systemctl enable lucrium-worker.service >/dev/null
 systemctl restart lucrium-worker.service
 
 TOKEN="$("$WORKER_BIN" show-token --config "$CONFIG_FILE")"
-IP="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
 SCHEME="ws"; [ "$TLS_ENABLED" = "1" ] && [ -f "$CONFIG_DIR/tls/cert.pem" ] && SCHEME="wss"
 
 echo
 echo "============================================================"
 echo " Lucrium Worker установлен и запущен"
 echo "   Адрес: $SCHEME://$IP:$PORT"
-echo "   Токен: $TOKEN"
+if [ "$FRESH" = "1" ]; then
+  echo "   Токен: $TOKEN"
+else
+  echo "   Токен: не менялся (показать: $WORKER_BIN show-token --config $CONFIG_FILE)"
+fi
+if [ -n "$FINGERPRINT" ] && [ "$SCHEME" = "wss" ]; then
+  echo "   Fingerprint сертификата (SHA256):"
+  echo "   $FINGERPRINT"
+fi
 echo "============================================================"
 if [ "$FRESH" = "1" ]; then
-  echo " Сохраните токен: он показывается один раз."
+  echo " Сохраните токен и fingerprint: для self-signed сертификата"
+  echo " fingerprint защищает панель от MITM."
 else
   echo " Конфиг уже существовал — токен не менялся."
 fi
