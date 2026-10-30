@@ -56,6 +56,14 @@ install_packages
 IP="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
 [ -n "$IP" ] || IP="SERVER_IP"
 
+if command -v bwrap >/dev/null; then
+  if ! bwrap --unshare-all --cap-drop ALL --ro-bind / / --dev /dev --proc /proc -- true >/dev/null 2>&1; then
+    log "warning: bubblewrap probe failed; plugins with sandbox=require will not start"
+  fi
+else
+  log "warning: bubblewrap is not installed; plugins with sandbox=require will not start"
+fi
+
 if ! command -v uv >/dev/null; then
   log "installing uv"
   curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh >/dev/null

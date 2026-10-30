@@ -84,6 +84,7 @@ class PluginHost:
         on_error: ErrorCallback | None = None,
         on_change: ChangeCallback | None = None,
         sandbox: bool = True,
+        sandbox_required: bool = False,
         data_dir: Path | None = None,
         config_dir: Path | None = None,
     ) -> None:
@@ -100,13 +101,21 @@ class PluginHost:
         self._processes: dict[str, _PluginProcess] = {}
         self._restart_tasks: dict[str, asyncio.Task[None]] = {}
         self._last_errors: dict[str, str] = {}
+        self.sandbox_required = sandbox_required
         self.sandbox_available = sandbox and _sandbox_available()
         if sandbox and not self.sandbox_available:
-            self._logs.add(
-                LogLevel.WARNING,
-                "worker",
-                "plugin sandbox requested but bubblewrap/userns unavailable; plugins run without OS isolation",
-            )
+            if sandbox_required:
+                self._logs.add(
+                    LogLevel.ERROR,
+                    "worker",
+                    "plugin sandbox is required but bubblewrap/userns is unavailable; plugins will not start",
+                )
+            else:
+                self._logs.add(
+                    LogLevel.WARNING,
+                    "worker",
+                    "plugin sandbox requested but bubblewrap/userns unavailable; plugins run without OS isolation",
+                )
 
     # --- запросы --------------------------------------------------------------
 
@@ -129,6 +138,10 @@ class PluginHost:
     async def start(self, record: PluginRecord) -> None:
         if record.id in self._processes:
             return
+        if self.sandbox_required and not self.sandbox_available:
+            message = "plugin sandbox is required but bubblewrap/userns is unavailable"
+            self._last_errors[record.id] = message
+            raise RuntimeError(message)
         try:
             validate_plugin_id(record.id)
         except Exception as exc:

@@ -18,10 +18,11 @@ git -c gpg.ssh.allowedSignersFile=security/allowed_signers verify-tag v0.1.0
 
 ## Plugin trust
 
-Plugins are code. When `plugins.sandbox = "require"` (recommended), the worker
+Plugins are code. With `plugins.sandbox = "require"` (the default), the worker
 does not start a plugin unless bubblewrap/user namespaces work. The sandbox hides
 `data_dir` and the worker config, and disables networking for plugins without
-`permissions.network = true`.
+`permissions.network = true`. `auto` is an explicit compatibility fallback;
+`off` disables isolation.
 
 ## Reporting
 

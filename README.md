@@ -55,7 +55,7 @@ seconds = 15
 
 [plugins]
 memory_limit_mb = 512       # RLIMIT_AS для процесса плагина
-sandbox = true              # bubblewrap: скрыть data/config, оставить код+socket
+sandbox = "require"         # require | auto | off
 ```
 
 Журнал воркера и плагинов дублируется в `data_dir/logs/worker.log` (JSON-строки)
@@ -94,9 +94,9 @@ sandbox = true              # bubblewrap: скрыть data/config, остави
 - **Плагины — доверенный код.** При наличии `bubblewrap` воркер запускает
   плагин в отдельном namespace: `data_dir` и конфиг скрыты, доступны только
   каталог плагина (read-only) и сокет; без `network = true` отключается сеть.
-  Если `bubblewrap`/user namespaces недоступны, воркер пишет warning и
-  запускает плагин без ОС-изоляции — в этом режиме плагин может читать файлы
-  воркера (включая `secret.key`). Устанавливайте только проверенные плагины.
+  `sandbox = "require"` (по умолчанию) не даёт запустить плагин без sandbox;
+  `auto` оставляет fallback с warning, `off` явно отключает изоляцию.
+  Устанавливайте только проверенные плагины.
 
 ## Разработка
 

@@ -89,6 +89,23 @@ def test_cli_config_before_subcommand_is_used(tmp_path: Path, capsys: pytest.Cap
     assert config.token in capsys.readouterr().out
 
 
+@pytest.mark.parametrize(
+    ("raw", "enabled", "required"),
+    [("require", True, True), ("auto", True, False), ("off", False, False), (True, True, False), (False, False, False)],
+)
+def test_plugin_sandbox_modes(tmp_path: Path, raw: object, enabled: bool, required: bool) -> None:
+    path = tmp_path / "worker.toml"
+    value = f'"{raw}"' if isinstance(raw, str) else str(raw).lower()
+    token_line = "a" * 64
+    path.write_text(
+        f'[worker]\ntoken = "{token_line}"\n[plugins]\nsandbox = {value}\n',
+        encoding="utf-8",
+    )
+    loaded = WorkerConfig.load(path)
+    assert loaded.plugin_sandbox is enabled
+    assert loaded.plugin_sandbox_required is required
+
+
 def test_tls_table_must_be_a_table(tmp_path: Path) -> None:
     path = tmp_path / "worker.toml"
     path.write_text('tls = "not a table"\n[worker]\ntoken = "' + "a" * 64 + '"\n', encoding="utf-8")

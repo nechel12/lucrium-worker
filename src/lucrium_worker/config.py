@@ -56,6 +56,7 @@ class WorkerConfig:
     event_retention_days: int = 30
     plugin_memory_limit_mb: int = 512
     plugin_sandbox: bool = True
+    plugin_sandbox_required: bool = True
     extra: dict[str, object] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
@@ -71,6 +72,8 @@ class WorkerConfig:
             raise ConfigError("plugins.memory_limit_mb must be positive")
         if not isinstance(self.plugin_sandbox, bool):
             raise ConfigError("plugins.sandbox must be a boolean")
+        if not isinstance(self.plugin_sandbox_required, bool):
+            raise ConfigError("plugins.sandbox require mode must be a boolean")
 
     @property
     def database_path(self) -> Path:
@@ -123,6 +126,7 @@ class WorkerConfig:
             tls = TlsConfig(certfile=Path(str(certfile)), keyfile=Path(str(keyfile)))
 
         token = os.environ.get("LUCRIUM_TOKEN", str(worker.get("token", "")))
+        sandbox, sandbox_required = _sandbox_mode(plugins.get("sandbox", "require"))
         try:
             return cls(
                 data_dir=data_dir,
@@ -134,7 +138,8 @@ class WorkerConfig:
                 log_level=str(worker.get("log_level", "info")),
                 event_retention_days=_as_int(storage.get("event_retention_days", 30), "storage.event_retention_days"),
                 plugin_memory_limit_mb=_as_int(plugins.get("memory_limit_mb", 512), "plugins.memory_limit_mb"),
-                plugin_sandbox=_as_bool(plugins.get("sandbox", True), "plugins.sandbox"),
+                plugin_sandbox=sandbox,
+                plugin_sandbox_required=sandbox_required,
             )
         except (TypeError, ValueError) as exc:
             raise ConfigError(f"invalid config values in {file}: {exc}") from exc
@@ -160,7 +165,7 @@ class WorkerConfig:
             "",
             "[plugins]",
             f"memory_limit_mb = {self.plugin_memory_limit_mb}",
-            f"sandbox = {'true' if self.plugin_sandbox else 'false'}",
+            f'sandbox = "{_sandbox_mode_value(self)}"',
         ]
         if self.tls is not None:
             lines += [
@@ -220,6 +225,28 @@ def _as_float(value: object, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float | str):
         raise ConfigError(f"{field} must be a number")
     return float(value)
+
+
+def _sandbox_mode(value: object) -> tuple[bool, bool]:
+    """Возвращает (enabled, required) для plugins.sandbox."""
+    if isinstance(value, bool):
+        # Совместимость со старыми конфигами: true = auto, false = off.
+        return value, False
+    if isinstance(value, str):
+        mode = value.strip().lower()
+        if mode == "require":
+            return True, True
+        if mode == "auto":
+            return True, False
+        if mode == "off":
+            return False, False
+    raise ConfigError("plugins.sandbox must be 'require', 'auto', 'off' or boolean")
+
+
+def _sandbox_mode_value(config: WorkerConfig) -> str:
+    if not config.plugin_sandbox:
+        return "off"
+    return "require" if config.plugin_sandbox_required else "auto"
 
 
 def _as_bool(value: object, field: str) -> bool:

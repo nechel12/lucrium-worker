@@ -111,6 +111,7 @@ class WorkerApp:
             on_change=self._touch,
             memory_limit_bytes=self.config.plugin_memory_limit_mb * 1024 * 1024,
             sandbox=self.config.plugin_sandbox,
+            sandbox_required=self.config.plugin_sandbox_required,
             data_dir=self.config.data_dir,
             config_dir=config_path.parent if config_path is not None else None,
         )
