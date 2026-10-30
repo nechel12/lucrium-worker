@@ -19,6 +19,7 @@ CONFIG_DIR="${LUCRIUM_CONFIG_DIR:-/etc/lucrium}"
 DATA_DIR="${LUCRIUM_DATA_DIR:-/var/lib/lucrium}"
 SERVICE_USER="${LUCRIUM_USER:-lucrium}"
 TLS_ENABLED="${LUCRIUM_TLS:-1}"
+PYTHON_VERSION="${LUCRIUM_PYTHON:-3.12}"
 WORKER_URL="${LUCRIUM_REPO_URL:-https://github.com/nechel12/lucrium-worker.git}"
 PROTOCOL_URL="${LUCRIUM_PROTOCOL_URL:-https://github.com/nechel12/lucrium-protocol.git}"
 CONFIG_FILE="$CONFIG_DIR/worker.toml"
@@ -39,24 +40,20 @@ install_packages() {
   elif command -v yum >/dev/null; then
     yum install -y -q python3 python3-pip curl ca-certificates openssl
   else
-    log "unknown package manager; assuming python3/curl/openssl are installed"
+    log "unknown package manager; assuming curl/openssl are installed"
   fi
 }
 
 install_packages
-
-PYTHON_BIN="$(command -v python3 || true)"
-[ -n "$PYTHON_BIN" ] || die "python3 not found"
-"$PYTHON_BIN" - <<'PY' || die "Python 3.12+ is required"
-import sys
-raise SystemExit(0 if sys.version_info >= (3, 12) else 1)
-PY
 
 if ! command -v uv >/dev/null; then
   log "installing uv"
   curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh >/dev/null
 fi
 command -v uv >/dev/null || die "uv installation failed"
+
+log "installing Python $PYTHON_VERSION (uv-managed)"
+uv python install "$PYTHON_VERSION" >/dev/null || die "cannot install Python $PYTHON_VERSION"
 
 if ! id "$SERVICE_USER" >/dev/null 2>&1; then
   log "creating service user $SERVICE_USER"
@@ -71,7 +68,7 @@ clone_or_update() {
   if [ -d "$target/.git" ]; then
     log "updating $(basename "$target")"
     git -C "$target" fetch --quiet origin
-    git -C "$target" reset --hard --quiet origin/HEAD
+    git -C "$target" reset --hard --quiet origin/main
   else
     log "cloning $(basename "$target")"
     git clone --quiet --depth 1 "$url" "$target"
@@ -82,7 +79,7 @@ clone_or_update "$PROTOCOL_URL" "$INSTALL_DIR/lucrium-protocol"
 clone_or_update "$WORKER_URL" "$INSTALL_DIR/lucrium-worker"
 
 log "syncing python environment"
-(cd "$INSTALL_DIR/lucrium-worker" && uv sync --quiet --frozen)
+(cd "$INSTALL_DIR/lucrium-worker" && uv sync --quiet --frozen --python "$PYTHON_VERSION")
 
 WORKER_BIN="$INSTALL_DIR/lucrium-worker/.venv/bin/lucrium-worker"
 [ -x "$WORKER_BIN" ] || die "worker entrypoint not found: $WORKER_BIN"
@@ -104,11 +101,11 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 
 chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR" "$DATA_DIR"
-chown root:"$SERVICE_USER" "$CONFIG_FILE"
-chmod 640 "$CONFIG_FILE"
+chown "$SERVICE_USER:$SERVICE_USER" "$CONFIG_FILE"
+chmod 600 "$CONFIG_FILE"
 if [ -d "$CONFIG_DIR/tls" ]; then
-  chown -R root:"$SERVICE_USER" "$CONFIG_DIR/tls"
-  chmod 640 "$CONFIG_DIR/tls/key.pem" "$CONFIG_DIR/tls/cert.pem"
+  chown -R "$SERVICE_USER:$SERVICE_USER" "$CONFIG_DIR/tls"
+  chmod 600 "$CONFIG_DIR/tls/key.pem" "$CONFIG_DIR/tls/cert.pem"
 fi
 
 log "installing systemd unit"
@@ -130,7 +127,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=$DATA_DIR
+ReadWritePaths=$DATA_DIR $CONFIG_DIR
 LimitNOFILE=65535
 
 [Install]
@@ -138,7 +135,8 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now lucrium-worker.service >/dev/null
+systemctl enable lucrium-worker.service >/dev/null
+systemctl restart lucrium-worker.service
 
 TOKEN="$("$WORKER_BIN" show-token --config "$CONFIG_FILE")"
 IP="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
