@@ -32,10 +32,19 @@ from .config import WorkerConfig
 from .logs import LogBuffer
 
 MAX_MESSAGE_BYTES = 80 * 1024 * 1024
+MAX_QUEUED_FRAMES = 2
+MAX_PANEL_CONNECTIONS = 8
+MAX_TRACKED_IPS = 2048
+FAILURE_TTL_SECONDS = 900.0
 
 
 class TokenAuth:
-    """Bearer-токен + backoff на IP после неудачных попыток (спека §3.1)."""
+    """Bearer-токен + backoff на IP после неудачных попыток (спека §3.1).
+
+    Засчитываем только попытки с предъявленным bearer-заголовком: иначе сканеры
+    публичного порта, стучащиеся без токена, забанят легитимную панель (а за
+    reverse-proxy они ещё и один IP с панелью).
+    """
 
     def __init__(
         self,
@@ -44,30 +53,59 @@ class TokenAuth:
         max_failures: int = 5,
         base_delay: float = 2.0,
         max_delay: float = 300.0,
+        max_ips: int = MAX_TRACKED_IPS,
+        failure_ttl: float = FAILURE_TTL_SECONDS,
     ) -> None:
         self._token_getter = token_getter
         self._max_failures = max_failures
         self._base_delay = base_delay
         self._max_delay = max_delay
+        self._max_ips = max_ips
+        self._failure_ttl = failure_ttl
         self._failures: dict[str, int] = {}
         self._blocked_until: dict[str, float] = {}
+        self._last_seen: dict[str, float] = {}
 
     def check(self, ip: str, token: str | None) -> bool:
         now = time.monotonic()
+        self._track(ip, now)
         until = self._blocked_until.get(ip)
-        if until is not None and until > now:
-            return False
+        if until is not None:
+            if until > now:
+                return False
+            self._blocked_until.pop(ip, None)
+            self._failures.pop(ip, None)
         expected = self._token_getter()
         if token is not None and hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8")):
             self._failures.pop(ip, None)
             self._blocked_until.pop(ip, None)
+            self._last_seen.pop(ip, None)
             return True
+        if token is None:
+            return False
         failures = self._failures.get(ip, 0) + 1
         self._failures[ip] = failures
         if failures >= self._max_failures:
             delay = min(self._base_delay * (2 ** (failures - self._max_failures)), self._max_delay)
             self._blocked_until[ip] = now + delay
         return False
+
+    def _track(self, ip: str, now: float) -> None:
+        """Не храним счётчики вечно: порт публичный, IP приходят разные."""
+        self._last_seen[ip] = now
+        expired = [item for item, seen in self._last_seen.items() if now - seen > self._failure_ttl]
+        for item in expired:
+            self._forget(item)
+        overflow = len(self._last_seen) - self._max_ips
+        if overflow <= 0:
+            return
+        for item, _ in sorted(self._last_seen.items(), key=lambda pair: pair[1])[:overflow]:
+            self._forget(item)
+
+    def _forget(self, ip: str) -> None:
+        self._last_seen.pop(ip, None)
+        self._failures.pop(ip, None)
+        self._blocked_until.pop(ip, None)
 
 
 class PanelServer:
@@ -89,6 +127,7 @@ class PanelServer:
             ssl=ssl_context,
             process_request=self._process_request,
             max_size=MAX_MESSAGE_BYTES,
+            max_queue=MAX_QUEUED_FRAMES,
             ping_interval=20,
             ping_timeout=20,
         )
@@ -132,6 +171,9 @@ class PanelServer:
     # --- websockets -----------------------------------------------------------
 
     def _process_request(self, connection: ServerConnection, request: Any) -> Any:
+        server = self._server
+        if server is not None and len(server.connections) > MAX_PANEL_CONNECTIONS:
+            return connection.respond(HTTPStatus.SERVICE_UNAVAILABLE, "too many connections\n")
         ip = connection.remote_address[0] if connection.remote_address else "unknown"
         token = _bearer(request.headers)
         if not self._auth.check(ip, token):

@@ -33,6 +33,23 @@ def test_token_auth_rate_limit() -> None:
     assert auth.check("2.2.2.2", "secret-token") is True
 
 
+def test_token_auth_ignores_probes_without_a_token() -> None:
+    """Сканер публичного порта не должен забанить легитимную панель с того же IP."""
+    auth = TokenAuth(lambda: "secret-token", max_failures=2, base_delay=10.0)
+    for _ in range(5):
+        assert auth.check("3.3.3.3", None) is False
+    assert auth.check("3.3.3.3", "secret-token") is True
+
+
+def test_token_auth_bounds_tracked_ips() -> None:
+    auth = TokenAuth(lambda: "secret-token", max_failures=2, base_delay=10.0, max_ips=2)
+    assert auth.check("4.4.4.1", "wrong") is False
+    assert auth.check("4.4.4.2", "wrong") is False
+    assert auth.check("4.4.4.3", "wrong") is False  # вытесняет самый старый IP
+    assert "4.4.4.1" not in auth._failures
+    assert len(auth._last_seen) <= 2
+
+
 async def test_unauthorized_rejected(app: WorkerApp) -> None:
     port = free_port()
     server = PanelServer(replace(app.config, port=port), app, app.logs)
