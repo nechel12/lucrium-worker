@@ -33,6 +33,7 @@ from lucrium_protocol import (
     PluginError,
     PluginManifest,
     PluginStatus,
+    redact_exception_text,
 )
 from lucrium_protocol.ipc import (
     HTTP_REQUEST,
@@ -54,8 +55,13 @@ from lucrium_protocol.ipc import (
     SessionCallParams,
     StartParams,
     StopParams,
+    StorageDeleteParams,
+    StorageGetParams,
+    StorageListParams,
+    StorageSetParams,
 )
 from lucrium_protocol.manifest import ManifestPermissions
+from pydantic import ValidationError
 
 from ..logs import LogBuffer
 from ..sessions import SessionError, SessionManager
@@ -532,23 +538,32 @@ class _PluginProcess:
         return False
 
     async def _handle_request(self, method: str, params: dict[str, Any]) -> Any:
+        try:
+            return await self._dispatch_request(method, params)
+        except ValidationError as exc:
+            raise PluginRpcError(_rpc_error(RpcErrorCode.INVALID_PARAMS, redact_exception_text(exc))) from exc
+
+    async def _dispatch_request(self, method: str, params: dict[str, Any]) -> Any:
         storage = self.host._storage
         plugin_id = self.record.id
         if method == STORAGE_GET:
-            return {"value": await storage.kv_get(plugin_id, str(params["key"]))}
+            parsed_get = StorageGetParams.model_validate(params)
+            return {"value": await storage.kv_get(plugin_id, parsed_get.key)}
         if method == STORAGE_SET:
-            value = params.get("value")
-            if len(json.dumps(value, ensure_ascii=False).encode("utf-8")) > MAX_KV_VALUE_BYTES:
+            parsed_set = StorageSetParams.model_validate(params)
+            if len(json.dumps(parsed_set.value, ensure_ascii=False).encode("utf-8")) > MAX_KV_VALUE_BYTES:
                 raise PluginRpcError(
                     _rpc_error(RpcErrorCode.INVALID_PARAMS, f"KV value exceeds {MAX_KV_VALUE_BYTES} bytes")
                 )
-            await storage.kv_set(plugin_id, str(params["key"]), value)
+            await storage.kv_set(plugin_id, parsed_set.key, parsed_set.value)
             return {}
         if method == STORAGE_DELETE:
-            await storage.kv_delete(plugin_id, str(params["key"]))
+            parsed_delete = StorageDeleteParams.model_validate(params)
+            await storage.kv_delete(plugin_id, parsed_delete.key)
             return {}
         if method == STORAGE_LIST:
-            return {"keys": await storage.kv_keys(plugin_id, str(params.get("prefix", "")))}
+            parsed_list = StorageListParams.model_validate(params)
+            return {"keys": await storage.kv_keys(plugin_id, parsed_list.prefix)}
         if method == LOG_WRITE:
             parsed = LogWriteParams.model_validate(params)
             self.host._logs.add(parsed.level, plugin_id, parsed.message, parsed.fields)

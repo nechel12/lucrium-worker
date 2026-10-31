@@ -82,6 +82,34 @@ async def _no_spawn_start(self: _PluginProcess) -> None:
     self.status = PluginStatus.RUNNING
 
 
+async def test_kv_params_are_validated_before_touching_storage(tmp_path: Path) -> None:
+    """Ключ/значение KV проходят через модели IPC: раньше ключ брали как str(params["key"])."""
+    from lucrium_plugin_sdk.manifest import load_manifest
+    from lucrium_protocol.ipc import STORAGE_SET
+    from lucrium_worker.plugins.host import _PluginProcess
+    from lucrium_worker.plugins.rpc import PluginRpcError
+
+    storage = Storage(tmp_path / "lucrium.db", tmp_path / "secret.key")
+    await storage.open()
+    installer = PluginInstaller(tmp_path / "plugins")
+    installed = installer.install(plugin_zip())
+    host = _host(tmp_path, installer, storage)
+    process = _PluginProcess(
+        record=_record("test-plugin", ManifestPermissions()),
+        manifest=load_manifest(installed.directory),
+        directory=installed.directory,
+        socket_path=tmp_path / "sockets" / "test-plugin" / "plugin.sock",
+        host=host,
+    )
+    with pytest.raises(PluginRpcError):
+        await process._handle_request(STORAGE_SET, {"key": "k" * 600, "value": 1})
+    with pytest.raises(PluginRpcError):
+        await process._handle_request(STORAGE_SET, {"value": 1})
+    assert await process._handle_request(STORAGE_SET, {"key": "k", "value": 1}) == {}
+    assert await storage.kv_get("test-plugin", "k") == 1
+    await storage.close()
+
+
 def test_duplicate_manifest_entries_rejected(tmp_path: Path) -> None:
     installer = PluginInstaller(tmp_path / "plugins")
     buffer = io.BytesIO()
