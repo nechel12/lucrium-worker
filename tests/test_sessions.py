@@ -176,3 +176,36 @@ async def test_panel_listing_ops_do_not_need_finance(manager: SessionManager) ->
 
     with pytest.raises(SessionError, match=r"permissions\.finance"):
         await manager.call("acc-1", "lots.raise_category", {}, panel=True)
+
+
+async def test_rejected_credentials_stop_the_supervisor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Мёртвый golden_key не должен превращаться в бесконечный шторм запросов."""
+    import asyncio
+
+    from aiosellers.funpay.exceptions import UnauthorizedError
+
+    from .conftest import make_account
+
+    attempts: list[str] = []
+
+    def reject_credentials(record: Any, state: Any) -> Any:
+        del state
+        attempts.append(record.id)
+        raise UnauthorizedError("golden key rejected")
+
+    monkeypatch.setattr("lucrium_worker.sessions.build_client", reject_credentials)
+
+    async def on_event(event: HubEvent) -> None:
+        return None
+
+    manager = SessionManager(data_dir=tmp_path, on_event=on_event, logs=LogBuffer())
+    runtime = await manager.start(make_account("acc-1"))
+    for _ in range(20):
+        await asyncio.sleep(0.05)
+        if runtime.status is SessionStatus.ERROR:
+            break
+
+    assert runtime.status is SessionStatus.ERROR
+    assert attempts == ["acc-1"]  # одна попытка, без ретраев
+    assert "отвергла" in (runtime.last_error or "")
+    await manager.stop("acc-1")

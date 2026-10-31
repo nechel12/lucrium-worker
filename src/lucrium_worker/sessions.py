@@ -10,8 +10,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import random
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,7 +29,9 @@ from aiosellers import (
     SellerHub,
     SQLiteStateStore,
 )
-from lucrium_protocol import HubEvent, LogLevel, Platform, SessionStatus
+from aiosellers.funpay.exceptions import UnauthorizedError as FunPayUnauthorizedError
+from aiosellers.ggsel.exceptions import UnauthorizedError as GGselUnauthorizedError
+from lucrium_protocol import HubEvent, LogLevel, Platform, SessionStatus, redact_exception_text
 
 from .client_policy import ALLOWED_CLIENT_ROOTS, is_financial_method, unsafe_call_params
 from .logs import LogBuffer
@@ -38,6 +41,11 @@ from .storage import AccountRecord
 BACKOFF_START = 1.0
 BACKOFF_MAX = 30.0
 BACKOFF_RESET_AFTER = 60.0
+
+#: Площадка сама сказала, что креды невалидны: ретраить бессмысленно и опасно
+#: (постоянные запросы с мёртвым golden_key = блокировка аккаунта).
+#: Playerok такого типизированного исключения не имеет, там остаётся ретрай.
+UNAUTHORIZED_ERRORS = (FunPayUnauthorizedError, GGselUnauthorizedError)
 
 EventHandler = Callable[[HubEvent], Awaitable[None]]
 
@@ -60,6 +68,11 @@ class SessionRuntime:
     stopping: bool = False
     client: SellerClient | None = field(default=None, repr=False)
     state_store: SQLiteStateStore | None = field(default=None, repr=False)
+
+
+def _with_jitter(delay: float) -> float:
+    """Разнос пауз: несколько аккаунтов не должны ломаться на площадку синхронно."""
+    return delay * (0.75 + random.random() * 0.5)
 
 
 def build_client(record: AccountRecord, state: SQLiteStateStore) -> SellerClient:
@@ -232,6 +245,7 @@ class SessionManager:
             state: SQLiteStateStore | None = None
             hub = SellerHub()
             running_since: float | None = None
+            stream: AsyncIterator[Any] | None = None
             try:
                 state = SQLiteStateStore(self._data_dir / "sessions" / f"{record.id}.db")
                 runtime.state_store = state
@@ -248,29 +262,42 @@ class SessionManager:
                 self._logs.add(
                     LogLevel.INFO, "worker", f"session {record.id} started", {"platform": record.platform.value}
                 )
-                async for event in hub.stream():
+                stream = hub.stream()
+                async for event in stream:
                     runtime.last_event_at = datetime.now(UTC)
                     await self._on_event(hub_event_to_protocol(event))
                 raise SessionError("platform event stream ended unexpectedly")
             except asyncio.CancelledError:
                 raise
+            except UNAUTHORIZED_ERRORS as exc:
+                # Площадка отвергла креды: ретраи превратятся в бесконечный шторм
+                # запросов с мёртвым токеном, а это риск блокировки аккаунта
+                self._stop_for_reauth(record, runtime, exc)
+                break
             except Exception as exc:
                 if running_since is not None and time.monotonic() - running_since >= BACKOFF_RESET_AFTER:
                     # Сессия была стабильной: следующую серию ошибок начинаем
                     # снова с короткой паузы.
                     backoff = BACKOFF_START
                 runtime.status = SessionStatus.ERROR
-                runtime.last_error = f"{type(exc).__name__}: {exc}"[:2000]
+                runtime.last_error = redact_exception_text(exc)[:2000]
                 runtime.restarts += 1
                 self._notify_change()
                 self._logs.add(
                     LogLevel.ERROR,
                     "worker",
                     f"session {record.id} failed: {runtime.last_error}",
-                    {"platform": record.platform.value, "restart_in": backoff},
+                    {"platform": record.platform.value, "restart_in": round(backoff, 1)},
                 )
             finally:
                 runtime.client = None
+                if stream is not None:
+                    # генератор hub.stream() отменяет pump-задачи хаба только при
+                    # своей финализации: закрыть его нужно до закрытия стора,
+                    # иначе недозаписанный курсор удвоит события после рестарта
+                    with contextlib.suppress(Exception):
+                        # hub.stream() — async-генератор, но библиотека объявляет AsyncIterator
+                        await cast("AsyncGenerator[Any, None]", stream).aclose()
                 with contextlib.suppress(Exception):
                     await hub.close()
                 if state is not None:
@@ -279,8 +306,22 @@ class SessionManager:
                 runtime.state_store = None
             if runtime.stopping:
                 break
-            await asyncio.sleep(backoff)
+            await asyncio.sleep(_with_jitter(backoff))
             backoff = min(backoff * 2, BACKOFF_MAX)
+
+    def _stop_for_reauth(self, record: AccountRecord, runtime: SessionRuntime, exc: BaseException) -> None:
+        runtime.status = SessionStatus.ERROR
+        runtime.last_error = (
+            f"{redact_exception_text(exc)} — площадка отвергла креды, "
+            "нужен новый токен (account пересоздаётся из панели)"
+        )[:2000]
+        self._notify_change()
+        self._logs.add(
+            LogLevel.ERROR,
+            "worker",
+            f"session {record.id} stopped: credentials rejected",
+            {"platform": record.platform.value},
+        )
 
 
 __all__ = [
