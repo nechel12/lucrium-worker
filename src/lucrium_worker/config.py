@@ -230,8 +230,10 @@ def _as_float(value: object, field: str) -> float:
 def _sandbox_mode(value: object) -> tuple[bool, bool]:
     """Возвращает (enabled, required) для plugins.sandbox."""
     if isinstance(value, bool):
-        # Совместимость со старыми конфигами: true = auto, false = off.
-        return value, False
+        # Старые конфиги писали булево значение: true теперь означает require,
+        # молча запускать плагины без изоляции небезопасно. Осознанный откат —
+        # явные "auto" или "off".
+        return value, value
     if isinstance(value, str):
         mode = value.strip().lower()
         if mode == "require":

@@ -9,6 +9,8 @@ import inspect
 import json
 import os
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import urllib.error
@@ -100,7 +102,7 @@ class PluginHost:
         on_error: ErrorCallback | None = None,
         on_change: ChangeCallback | None = None,
         sandbox: bool = True,
-        sandbox_required: bool = False,
+        sandbox_required: bool = True,
         data_dir: Path | None = None,
         config_dir: Path | None = None,
     ) -> None:
@@ -117,7 +119,8 @@ class PluginHost:
         self._processes: dict[str, _PluginProcess] = {}
         self._restart_tasks: dict[str, asyncio.Task[None]] = {}
         self._last_errors: dict[str, str] = {}
-        self.sandbox_required = sandbox_required
+        # хост, явно отключивший песочницу, не может её требовать
+        self.sandbox_required = sandbox_required and sandbox
         self.sandbox_available = sandbox and _sandbox_available()
         if sandbox and not self.sandbox_available:
             if sandbox_required:
@@ -480,12 +483,43 @@ class _PluginProcess:
     # --- IPC ------------------------------------------------------------------
 
     async def _on_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        if self._connected is not None and not self._connected.done():
-            self._connected.set_result((reader, writer))
-        else:
+        if self._connected is None or self._connected.done():
             writer.close()
             with contextlib.suppress(OSError):
                 await writer.wait_closed()
+            return
+        # Первое подключившееся соединение не может быть принято без проверки:
+        # плагин — чужой код, а сокет доступен любому процессу того же uid.
+        if not self._peer_is_plugin_process(writer):
+            self.host._logs.add(
+                LogLevel.WARNING, self.record.id, "rejected a connection to the plugin socket from another process"
+            )
+            writer.close()
+            with contextlib.suppress(OSError):
+                await writer.wait_closed()
+            return
+        self._connected.set_result((reader, writer))
+
+    def _peer_is_plugin_process(self, writer: asyncio.StreamWriter) -> bool:
+        process = self._process
+        if process is None or sys.platform not in {"linux", "linux2"}:
+            return True
+        credentials = _peer_credentials(writer)
+        if credentials is None:
+            return False
+        pid, uid = credentials
+        if uid != os.getuid():
+            return False
+        # без песочницы точка входа — наш прямой ребёнок; под bwrap она на
+        # уровень глубже, поэтому поднимаемся по цепочке предков
+        current: int | None = pid
+        for _ in range(4):
+            if current is None:
+                return False
+            if current == process.pid:
+                return True
+            current = _parent_pid(current)
+        return False
 
     async def _handle_request(self, method: str, params: dict[str, Any]) -> Any:
         storage = self.host._storage
@@ -602,24 +636,27 @@ def _sandbox_command(
         "--tmpfs",
         "/tmp",
     ]
-    if data_dir.exists():
-        command += [
-            "--tmpfs",
-            str(data_dir),
-            "--dir",
-            str(plugin_dir.parent),
-            "--dir",
-            str(plugin_dir),
-            "--dir",
-            str(sockets_dir),
-            "--ro-bind",
-            str(plugin_dir),
-            str(plugin_dir),
-            "--bind",
-            str(sockets_dir),
-            str(sockets_dir),
-        ]
-    if config_dir is not None and config_dir.exists():
+    if not data_dir.is_dir():
+        raise RuntimeError(f"plugin sandbox: data directory {data_dir} does not exist")
+    command += [
+        "--tmpfs",
+        str(data_dir),
+        "--dir",
+        str(plugin_dir.parent),
+        "--dir",
+        str(plugin_dir),
+        "--dir",
+        str(sockets_dir),
+        "--ro-bind",
+        str(plugin_dir),
+        str(plugin_dir),
+        "--bind",
+        str(sockets_dir),
+        str(sockets_dir),
+    ]
+    if config_dir is not None:
+        if not config_dir.is_dir():
+            raise RuntimeError(f"plugin sandbox: config directory {config_dir} does not exist")
         command += ["--tmpfs", str(config_dir)]
     if network:
         command.append("--share-net")
@@ -693,6 +730,29 @@ def _plugin_env(directory: Path, socket_path: Path) -> dict[str, str]:
 
 def _rpc_error(code: int, message: str) -> RpcError:
     return RpcError(code=code, message=message)
+
+
+def _peer_credentials(writer: asyncio.StreamWriter) -> tuple[int, int] | None:
+    """``(pid, uid)`` процесса на другом конце unix-сокета."""
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return None
+    try:
+        raw = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.pack("3i", 0, 0, 0))
+    except OSError:
+        return None
+    pid, uid, _gid = struct.unpack("3i", raw)
+    return pid, uid
+
+
+def _parent_pid(pid: int) -> int | None:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    # имя в скобках может содержать пробелы — поля считаем после последней скобки
+    fields = stat.rsplit(")", 1)[-1].split()
+    return int(fields[1]) if len(fields) > 1 else None
 
 
 def _supports_prlimit() -> bool:

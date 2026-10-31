@@ -91,7 +91,13 @@ def test_cli_config_before_subcommand_is_used(tmp_path: Path, capsys: pytest.Cap
 
 @pytest.mark.parametrize(
     ("raw", "enabled", "required"),
-    [("require", True, True), ("auto", True, False), ("off", False, False), (True, True, False), (False, False, False)],
+    [
+        ("require", True, True),
+        ("auto", True, False),
+        ("off", False, False),
+        (True, True, True),
+        (False, False, False),
+    ],
 )
 def test_plugin_sandbox_modes(tmp_path: Path, raw: object, enabled: bool, required: bool) -> None:
     path = tmp_path / "worker.toml"
