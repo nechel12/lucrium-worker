@@ -875,9 +875,11 @@ class WorkerApp:
         finally:
             # Даже при ошибке импорта возвращаем воркер в рабочее состояние
             # (БД откатывается транзакцией, файлы плагинов — backup'ом).
-            await self._restore_sessions()
-            await self._restore_plugins()
-            self._touch()
+            # Отмена команды не должна бросать рестров на полпути: задача живёт
+            # отдельно, а awaiting подавляем целиком.
+            restore = asyncio.create_task(self._restore_runtime_state(), name="worker-import-restore")
+            with contextlib.suppress(BaseException):
+                await asyncio.shield(restore)
         return result.model_copy(
             update={
                 "sessions_started": len(
@@ -885,6 +887,11 @@ class WorkerApp:
                 )
             }
         )
+
+    async def _restore_runtime_state(self) -> None:
+        await self._restore_sessions()
+        await self._restore_plugins()
+        self._touch()
 
 
 def _verify_sha256(archive: bytes, expected: str | None) -> None:

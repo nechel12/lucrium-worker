@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -212,3 +213,42 @@ async def test_clear_all(storage: Storage) -> None:
     assert await storage.list_accounts() == []
     assert await storage.kv_keys("test-plugin") == []
     assert await storage.list_all_events() == []
+
+
+async def test_transaction_hides_a_partial_batch_from_other_writers(tmp_path: Path) -> None:
+    """Сторонняя запись не должна фиксировать середину батча импорта (H2)."""
+    path = tmp_path / "lucrium.db"
+    storage = Storage(path, tmp_path / "secret.key")
+    await storage.open()
+    await storage.upsert_account(make_account("acc-1"))
+    watcher = sqlite3.connect(path)
+    try:
+        async with storage.transaction():
+            await storage.clear_all(commit=False)
+            # обычная запись с commit=True внутри транзакции импорта ничего не фиксирует
+            await storage.kv_set("test-plugin", "k", "v")
+            assert len(watcher.execute("SELECT id FROM accounts").fetchall()) == 1
+        assert len(watcher.execute("SELECT id FROM accounts").fetchall()) == 0
+        assert len(watcher.execute("SELECT plugin_id FROM plugin_kv").fetchall()) == 1
+    finally:
+        watcher.close()
+        await storage.close()
+
+
+async def test_transaction_rolls_back_and_rejects_nesting(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "lucrium.db", tmp_path / "secret.key")
+    await storage.open()
+    try:
+        await storage.upsert_account(make_account("acc-1"))
+        with pytest.raises(RuntimeError, match="boom"):
+            async with storage.transaction():
+                await storage.clear_all(commit=False)
+                raise RuntimeError("boom")
+        assert [record.id for record in await storage.list_accounts()] == ["acc-1"]
+
+        async with storage.transaction():
+            with pytest.raises(StorageError, match="nested"):
+                async with storage.transaction():
+                    pass
+    finally:
+        await storage.close()

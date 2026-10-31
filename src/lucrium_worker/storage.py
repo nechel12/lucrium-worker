@@ -7,9 +7,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -129,12 +131,47 @@ class Storage:
         self._secret_key_path = Path(secret_key_path)
         self._db: aiosqlite.Connection | None = None
         self._fernet: Fernet | None = None
+        self._tx_lock = asyncio.Lock()
+        self._tx_owner: asyncio.Task[None] | None = None
+        self._suspend_commits = 0
 
     @property
     def db(self) -> aiosqlite.Connection:
         if self._db is None:
             raise StorageError("storage is not open")
         return self._db
+
+    @contextlib.asynccontextmanager
+    async def transaction(self) -> AsyncIterator[None]:
+        """Атомарная батч-запись: никто другой не может зафиксировать её середину.
+
+        Соединение aiosqlite одно, и обычный ``commit()`` из сторонней записи
+        (событие хаба, KV плагина) зафиксировал бы половину импорта состояния.
+        Пока транзакция открыта, чужие коммиты откладываются до её владельца.
+        Ожидание лока — нормальная ситуация для второго писателя; повторная
+        попытка в том же task — нет (await на собственном лока завис бы навсегда).
+        """
+        owner = asyncio.current_task()
+        if self._tx_owner is not None and self._tx_owner is owner:
+            raise StorageError("nested transactions are not supported")
+        async with self._tx_lock:
+            self._tx_owner = owner
+            self._suspend_commits += 1
+            try:
+                yield
+            except BaseException:
+                await self.db.rollback()
+                raise
+            else:
+                await self.db.commit()
+            finally:
+                self._suspend_commits -= 1
+                self._tx_owner = None
+
+    async def _commit(self) -> None:
+        if self._suspend_commits:
+            return
+        await self.db.commit()
 
     @property
     def fernet(self) -> Fernet:
@@ -232,7 +269,7 @@ class Storage:
             "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, payload),
         )
-        await self.db.commit()
+        await self._commit()
 
     # --- accounts -------------------------------------------------------------
 
@@ -273,18 +310,18 @@ class Storage:
             ),
         )
         if commit:
-            await self.db.commit()
+            await self._commit()
 
     async def set_account_desired_running(self, account_id: str, desired: bool) -> None:
         await self.db.execute(
             "UPDATE accounts SET desired_running = ?, updated_at = ? WHERE id = ?",
             (int(desired), _iso(_now()), account_id),
         )
-        await self.db.commit()
+        await self._commit()
 
     async def delete_account(self, account_id: str) -> bool:
         cursor = await self.db.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
-        await self.db.commit()
+        await self._commit()
         return cursor.rowcount > 0
 
     def _account_from_row(self, row: aiosqlite.Row) -> AccountRecord:
@@ -345,13 +382,13 @@ class Storage:
             ),
         )
         if commit:
-            await self.db.commit()
+            await self._commit()
 
     async def delete_plugin(self, plugin_id: str, *, purge_data: bool) -> bool:
         cursor = await self.db.execute("DELETE FROM plugins WHERE id = ?", (plugin_id,))
         if purge_data:
             await self.db.execute("DELETE FROM plugin_kv WHERE plugin_id = ?", (plugin_id,))
-        await self.db.commit()
+        await self._commit()
         return cursor.rowcount > 0
 
     def _plugin_from_row(self, row: aiosqlite.Row) -> PluginRecord:
@@ -389,11 +426,11 @@ class Storage:
             (plugin_id, key, payload),
         )
         if commit:
-            await self.db.commit()
+            await self._commit()
 
     async def kv_delete(self, plugin_id: str, key: str) -> None:
         await self.db.execute("DELETE FROM plugin_kv WHERE plugin_id = ? AND key = ?", (plugin_id, key))
-        await self.db.commit()
+        await self._commit()
 
     async def kv_keys(self, plugin_id: str, prefix: str = "") -> list[str]:
         # substr вместо LIKE: префикс должен быть литеральным и регистрозависимым.
@@ -423,7 +460,7 @@ class Storage:
             ),
         )
         if commit:
-            await self.db.commit()
+            await self._commit()
         return int(cursor.lastrowid or 0)
 
     async def list_all_events(self) -> list[HubEvent]:
@@ -459,7 +496,7 @@ class Storage:
 
     async def purge_events(self, before: datetime) -> int:
         cursor = await self.db.execute("DELETE FROM events WHERE ts < ?", (_iso(before),))
-        await self.db.commit()
+        await self._commit()
         return cursor.rowcount
 
     async def clear_all(self, *, commit: bool = True) -> None:
@@ -469,7 +506,7 @@ class Storage:
         await self.db.execute("DELETE FROM plugin_kv")
         await self.db.execute("DELETE FROM events")
         if commit:
-            await self.db.commit()
+            await self._commit()
 
     # --- crypto ---------------------------------------------------------------
 

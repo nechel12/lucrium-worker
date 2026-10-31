@@ -242,21 +242,22 @@ async def import_state(
                 installed.append(installed_plugin.directory)
 
         try:
-            if mode is ImportMode.REPLACE:
-                await storage.clear_all(commit=False)
-            for account in state.accounts:
-                await storage.upsert_account(account, commit=False)
-            for record, data in state.plugins:
-                await storage.upsert_plugin(record, commit=False)
-                for key, value in data.items():
-                    await storage.kv_set(record.id, key, value, commit=False)
-            for event in state.events:
-                await storage.add_event(event, commit=False)
-            await storage.db.commit()
+            async with storage.transaction():
+                if mode is ImportMode.REPLACE:
+                    await storage.clear_all(commit=False)
+                for account in state.accounts:
+                    await storage.upsert_account(account, commit=False)
+                for record, data in state.plugins:
+                    await storage.upsert_plugin(record, commit=False)
+                    for key, value in data.items():
+                        await storage.kv_set(record.id, key, value, commit=False)
+                for event in state.events:
+                    await storage.add_event(event, commit=False)
+        except ExportError:
+            raise
         except Exception as exc:
-            await storage.db.rollback()
-            raise ExportError(f"cannot apply state dump: {exc}") from exc
-    except Exception:
+            raise ExportError(f"cannot apply state dump: {type(exc).__name__}") from exc
+    except BaseException:
         # Откатываем файловую часть, чтобы не оставить полуустановленный плагин.
         for directory in installed:
             shutil.rmtree(directory, ignore_errors=True)
