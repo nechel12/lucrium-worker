@@ -5,7 +5,7 @@
 > без обратной совместимости. Помощь с тестированием, отчёты об ошибках и находки
 > безопасности очень нужны — см. [CONTRIBUTING.md](CONTRIBUTING.md). Для реального
 > ведения продаж воркер пока **не готов**: не держите на нём рабочие аккаунты
-> площадок, для экспериментов используйте тестовые учётные записи.
+> площадок: для экспериментов нужны тестовые учётные записи.
 
 [![CI](https://github.com/nechel12/lucrium-worker/actions/workflows/ci.yml/badge.svg)](https://github.com/nechel12/lucrium-worker/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
@@ -32,19 +32,19 @@
 curl -fsSL https://raw.githubusercontent.com/nechel12/lucrium-worker/main/install.sh | bash
 ```
 
-`curl | bash` исполняет чужой код от root — сначала прочитайте скрипт. Скрипт
+`curl | bash` исполняет чужой код от root, поэтому скрипт сначала читают. Скрипт
 ставит Python 3.12+, `uv`, systemd-юнит, генерирует pairing-токен и
 (по умолчанию) самоподписанный TLS-сертификат, затем печатает `адрес + токен`.
-Токен показывается один раз — сохраните его.
+Токен показывается один раз, других копий воркер не держит.
 
 Переменные: `LUCRIUM_PORT` (8443), `LUCRIUM_DATA_DIR` (`/var/lib/lucrium`),
 `LUCRIUM_TLS=0` (отключить TLS), `LUCRIUM_REF` (тег/коммит, по умолчанию
 `main`), `LUCRIUM_REPO_URL`, `LUCRIUM_PROTOCOL_URL`. Значение по умолчанию `main`
 устанавливает неподписанный код из ветки развития и печатает предупреждение: для
-воспроизводимой установки задавайте подписанный `LUCRIUM_REF=vX.Y.Z`, для `v*`
+воспроизводимой установки нужен подписанный `LUCRIUM_REF=vX.Y.Z`, для `v*`
 установщик проверяет SSH-подпись тега. Проверку подписи можно отключить только
 осознанно: `LUCRIUM_ALLOW_UNSIGNED_TAGS=1`. Теги, созданные до введения подписи,
-не считаются доверенными — используйте ближайший подписанный релиз.
+не считаются доверенными: брать нужно ближайший подписанный релиз.
 
 При TLS установщик печатает SHA256 fingerprint самоподписанного сертификата. Его
 нужно вставить в панели: проверка TLS включена по умолчанию, а fingerprint даёт
@@ -54,7 +54,7 @@ curl -fsSL https://raw.githubusercontent.com/nechel12/lucrium-worker/main/instal
 использует `aiosellers`) и прописывает `TLS_LIBRARY_PATH` в systemd: при
 `ProtectSystem=strict` и root-owned venv скачивание в `site-packages` при первом
 запросе невозможно. Если GitHub с VPS недоступен, скачайте библиотеку вручную и
-передайте путь: `LUCRIUM_TLS_LIBRARY=/path/to/tls-client.so bash install.sh`.
+путь передают отдельно: `LUCRIUM_TLS_LIBRARY=/path/to/tls-client.so bash install.sh`.
 
 ## CLI
 
@@ -129,7 +129,7 @@ SDK плагинов — [`lucrium-plugin-sdk`](https://github.com/nechel12/lucr
   `reveal_credentials`, и каждое раскрытие пишется в журнал воркером как
   предупреждение.
 - TLS: самоподписанный сертификат или сертификат домена пользователя. Панель
-  проверяет TLS по умолчанию; для self-signed используйте fingerprint.
+  проверяет TLS по умолчанию; для self-signed нужен fingerprint.
 - **Плагины — чужой код, и это основная граница угрозы.** При наличии
   `bubblewrap` воркер запускает плагин в отдельных namespaces: `--unshare-all`
   без `--share-net`, каталоги данных и конфига скрыты за tmpfs, доступны только
@@ -154,8 +154,8 @@ SDK плагинов — [`lucrium-plugin-sdk`](https://github.com/nechel12/lucr
   бы наружу через чат площадки.
 - `sandbox = "require"` (по умолчанию) не даёт запустить плагин без изоляции;
   `auto` оставляет fallback с предупреждением, `off` явно отключает её.
-  Устанавливайте только проверенные плагины и считайте, что получивший
-  `network`/`finance` плагин умеет всё, что умеет ваша учётная запись.
+  Устанавливать стоит только проверенные плагины и помнить, что получивший
+  `network`/`finance` плагин умеет всё, что умеет учётная запись продавца.
 
 ## Разработка
 
