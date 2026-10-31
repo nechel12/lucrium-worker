@@ -477,7 +477,12 @@ class _PluginProcess:
             )
         try:
             data = await asyncio.wait_for(
-                self.host._sessions.call(runtime.account_id, call.method, call.params),
+                self.host._sessions.call(
+                    runtime.account_id,
+                    call.method,
+                    call.params,
+                    allow_finance=self.manifest.permissions.finance,
+                ),
                 timeout=SESSION_CALL_TIMEOUT,
             )
         except TimeoutError as exc:

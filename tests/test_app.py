@@ -171,6 +171,28 @@ async def test_call_client(app: WorkerApp) -> None:
     assert app.sessions.calls[-1] == (ref.account_id, "lots.list_self", {"subcategory_id": 1})  # type: ignore[attr-defined]
 
 
+async def test_call_client_rejects_financial_and_non_panel_methods(app: WorkerApp) -> None:
+    add = AddAccountParams.model_validate(
+        {
+            "account": {
+                "platform": "funpay",
+                "label": "FunPay",
+                "credentials": {"platform": "funpay", "golden_key": "gk"},
+            }
+        }
+    )
+    ref = _result(app, await _call(app, Command.ADD_ACCOUNT, add), Command.ADD_ACCOUNT)
+    for method in ("finance.withdraw", "transactions.withdraw", "orders.refund", "chats.send_message"):
+        response = await _call(
+            app,
+            Command.CALL_CLIENT,
+            CallClientParams(session_id=ref.account_id, client_method=method),
+        )
+        assert response.payload.error is not None
+        assert response.payload.error.code is ErrorCode.FORBIDDEN
+    assert app.sessions.calls == []  # type: ignore[attr-defined]
+
+
 async def test_get_logs(app: WorkerApp) -> None:
     from lucrium_protocol import LogLevel
 

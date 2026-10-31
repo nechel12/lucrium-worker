@@ -97,6 +97,9 @@ sandbox = "require"         # require | auto | off
   `sandbox = "require"` (по умолчанию) не даёт запустить плагин без sandbox;
   `auto` оставляет fallback с warning, `off` явно отключает изоляцию.
   Устанавливайте только проверенные плагины.
+- Финансовые вызовы клиента (`finance.*`, `transactions.*`, `orders.refund`,
+  `deals.cancel`) запрещены плагинам без `[permissions] finance = true` в
+  манифесте. Панель вызывает только безопасные методы лотов/товаров.
 
 ## Разработка
 

@@ -80,6 +80,7 @@ from lucrium_protocol import (
 
 from . import __version__
 from .accounts import AccountError, AccountService
+from .client_policy import is_panel_client_method
 from .config import WorkerConfig, ensure_directories
 from .export import ExportError, export_state, import_state, parse_state_dump
 from .logs import LogBuffer
@@ -472,13 +473,23 @@ class WorkerApp:
 
     async def _call_client(self, payload: CallClientParams) -> CallClientResult:
         """Вызов клиента aiosellers из панели (лоты/товары, §9)."""
+        if not is_panel_client_method(payload.client_method):
+            raise ProtocolError(
+                ErrorCode.FORBIDDEN,
+                f"client method {payload.client_method!r} is not available from the panel",
+            )
         try:
             runtime = self.sessions.resolve(payload.session_id)
         except SessionError as exc:
             raise ProtocolError(ErrorCode.NOT_FOUND, str(exc)) from exc
         try:
             data = await asyncio.wait_for(
-                self.sessions.call(runtime.account_id, payload.client_method, payload.params),
+                self.sessions.call(
+                    runtime.account_id,
+                    payload.client_method,
+                    payload.params,
+                    allow_finance=False,
+                ),
                 timeout=60,
             )
         except TimeoutError as exc:

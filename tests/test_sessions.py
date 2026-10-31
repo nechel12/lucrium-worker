@@ -68,3 +68,21 @@ async def test_private_and_unknown_roots_rejected(manager: SessionManager) -> No
 async def test_non_callable_method_rejected(manager: SessionManager) -> None:
     with pytest.raises(SessionError, match="not callable"):
         await manager.call("acc-1", "chats.calls", {})
+
+
+async def test_financial_methods_require_opt_in(manager: SessionManager) -> None:
+    client = manager.resolve("acc-1").client
+    assert client is not None
+    client.finance = SimpleNamespace(
+        withdraw=lambda **_: {"withdrawn": True},
+        save_wallets=lambda **_: {"saved": True},
+    )
+    client.orders = SimpleNamespace(refund=lambda **_: {"refunded": True})
+    client.deals = SimpleNamespace(cancel=lambda **_: {"cancelled": True})
+
+    for method in ("finance.withdraw", "finance.save_wallets", "orders.refund", "deals.cancel"):
+        with pytest.raises(SessionError, match="permissions.finance"):
+            await manager.call("acc-1", method, {})
+
+    assert await manager.call("acc-1", "finance.withdraw", {}, allow_finance=True) == {"withdrawn": True}
+    assert await manager.call("acc-1", "orders.refund", {}, allow_finance=True) == {"refunded": True}

@@ -29,33 +29,16 @@ from aiosellers import (
 )
 from lucrium_protocol import HubEvent, LogLevel, Platform, SessionStatus
 
+from .client_policy import ALLOWED_CLIENT_ROOTS, is_financial_method
 from .logs import LogBuffer
 from .serialization import hub_event_to_protocol, to_jsonable
 from .storage import AccountRecord
 
 BACKOFF_START = 1.0
 BACKOFF_MAX = 30.0
+BACKOFF_RESET_AFTER = 60.0
 
 EventHandler = Callable[[HubEvent], Awaitable[None]]
-
-
-ALLOWED_CLIENT_ROOTS = frozenset(
-    {
-        "account",
-        "categories",
-        "chats",
-        "deals",
-        "finance",
-        "games",
-        "items",
-        "lots",
-        "orders",
-        "products",
-        "reviews",
-        "sales",
-        "transactions",
-    }
-)
 
 
 class SessionError(Exception):
@@ -146,12 +129,26 @@ class SessionManager:
             raise SessionError("session_id is required when the plugin has no single running session")
         return running[0]
 
-    async def call(self, session_id: str | None, method: str, params: dict[str, Any]) -> Any:
-        """Вызов метода клиента aiosellers через dotted-путь (``chats.send_message``)."""
+    async def call(
+        self,
+        session_id: str | None,
+        method: str,
+        params: dict[str, Any],
+        *,
+        allow_finance: bool = False,
+    ) -> Any:
+        """Вызов метода клиента aiosellers через dotted-путь (``chats.send_message``).
+
+        Финансовые методы (``finance.*``, ``transactions.*``, ``orders.refund``,
+        ``deals.cancel``) доступны только при ``allow_finance=True`` — это
+        разрешение выдаётся плагину манифестом, панель его не получает.
+        """
         parts = method.split(".")
         root = parts[0]
         if root not in ALLOWED_CLIENT_ROOTS:
             raise SessionError(f"method {method!r} is not allowed")
+        if is_financial_method(method) and not allow_finance:
+            raise SessionError(f"method {method!r} requires permissions.finance = true")
         if any(part.startswith("_") or part in {"client", "transport", "raw"} for part in parts[1:]):
             raise SessionError(f"private client path {method!r} is not allowed")
         runtime = self.resolve(session_id)

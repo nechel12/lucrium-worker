@@ -71,7 +71,14 @@ class FakeSessions:
             raise RuntimeError(f"session {session_id!r} is not running")
         return runtime
 
-    async def call(self, session_id: str | None, method: str, params: dict[str, Any]) -> Any:
+    async def call(
+        self,
+        session_id: str | None,
+        method: str,
+        params: dict[str, Any],
+        *,
+        allow_finance: bool = False,
+    ) -> Any:
         self.calls.append((session_id, method, params))
         return {"ok": True, "method": method}
 
