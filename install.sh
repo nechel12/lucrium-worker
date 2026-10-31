@@ -254,7 +254,7 @@ Type=simple
 User=$SERVICE_USER
 Group=$SERVICE_USER
 Environment="TLS_LIBRARY_PATH=$TLS_LIBRARY_PATH"
-WorkingDirectory="$INSTALL_DIR/lucrium-worker"
+WorkingDirectory=$INSTALL_DIR/lucrium-worker
 ExecStart="$WORKER_BIN" run --config "$CONFIG_FILE"
 Restart=always
 RestartSec=5
