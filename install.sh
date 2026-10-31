@@ -158,6 +158,14 @@ run_as_service() {
   fi
 }
 
+if command -v bwrap >/dev/null 2>&1; then
+  if ! run_as_service bwrap --unshare-all --die-with-parent --cap-drop ALL \
+    --ro-bind / / --dev /dev --proc /proc -- true >/dev/null 2>&1; then
+    log "warning: bwrap cannot create a user namespace as $SERVICE_USER"
+    log "warning: plugins with sandbox=require will not start; Ubuntu 24.04 may need an AppArmor bwrap profile"
+  fi
+fi
+
 # aiosellers ходит через tls_requests, который не содержит native library в
 # wheel и скачивает её в site-packages при первом запросе. Под ProtectSystem=strict
 # и root-owned venv запись невозможна, поэтому библиотеку готовим заранее.
