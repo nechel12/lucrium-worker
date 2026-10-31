@@ -6,6 +6,7 @@ import asyncio
 import base64
 import contextlib
 import inspect
+import ipaddress
 import json
 import os
 import shutil
@@ -18,8 +19,10 @@ import urllib.request
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
+from http.client import HTTPMessage
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
+from urllib.parse import urlsplit
 
 from lucrium_plugin_sdk import PLUGIN_DIR_ENV, PLUGIN_SOCKET_ENV, load_manifest
 from lucrium_protocol import (
@@ -351,7 +354,6 @@ class _PluginProcess:
                 sockets_dir=self.socket_path.parent,
                 data_dir=self.host._data_dir,
                 config_dir=self.host._config_dir,
-                network=self.manifest.permissions.network,
             )
             if self.host.sandbox_available
             else [sys.executable, "-m", "lucrium_plugin_sdk"]
@@ -616,9 +618,14 @@ def _sandbox_command(
     sockets_dir: Path,
     data_dir: Path,
     config_dir: Path | None,
-    network: bool,
 ) -> list[str]:
-    """bubblewrap: скрыть data/config, оставить только код плагина и сокет."""
+    """bubblewrap: скрыть data/config, оставить только код плагина и сокет.
+
+    Сеть песочнице не выдаётся вовсе (``--unshare-all`` без ``--share-net``):
+    ``permissions.network`` означает доступ к ``ctx.http`, который делает воркер
+    со своей egress-политикой. Иначе флаг превращался бы в обход всей модели
+    разрешений — raw-сокеты, listening-порты, внутренний сегмент VPS.
+    """
     command = [
         "bwrap",
         "--unshare-all",
@@ -658,8 +665,6 @@ def _sandbox_command(
         if not config_dir.is_dir():
             raise RuntimeError(f"plugin sandbox: config directory {config_dir} does not exist")
         command += ["--tmpfs", str(config_dir)]
-    if network:
-        command.append("--share-net")
     command += [
         "--chdir",
         str(plugin_dir),
@@ -786,14 +791,63 @@ def _memory_limiter(limit_bytes: int) -> Callable[[], None]:
     return _limit
 
 
+def _assert_public_url(url: str) -> None:
+    """SSRF-гейт: запрос делает воркер, поэтому внутренность VPS недоступна плагину.
+
+    Остаточный риск: между проверкой и соединением DNS может ответить другим
+    адресом (rebinding). Полностью это закрывает только отдельный netns/прокси
+    с фиксированным IP — в v1 осознанно принято как ограничение.
+    """
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError("url must be http(s)")
+    host = parts.hostname
+    if not host:
+        raise ValueError("url has no host")
+    try:
+        addresses: set[ipaddress.IPv4Address | ipaddress.IPv6Address] = {ipaddress.ip_address(host)}
+    except ValueError:
+        port = parts.port or (443 if scheme == "https" else 80)
+        try:
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise ValueError(f"cannot resolve {host}: {exc}") from exc
+        addresses = {ipaddress.ip_address(info[4][0]) for info in infos}
+    for address in addresses:
+        mapped = getattr(address, "ipv4_mapped", None)
+        if mapped is not None:
+            address = mapped
+        if not address.is_global:
+            raise ValueError(f"{host} resolves to {address}, which is not a public address")
+
+
+class _ValidatedRedirects(urllib.request.HTTPRedirectHandler):
+    """Ревалидирует адрес на каждой ступени редиректа, а не только стартовый URL."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: HTTPMessage,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        _assert_public_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _http_request_sync(params: HttpRequestParams) -> HttpResponseResult:
     try:
         body = base64.b64decode(params.body_b64, validate=True) if params.body_b64 else None
     except (ValueError, TypeError) as exc:
         raise ValueError(f"body_b64 is not valid base64: {exc}") from exc
+    _assert_public_url(params.url)
     request = urllib.request.Request(params.url, data=body, method=params.method, headers=params.headers)
+    opener = urllib.request.build_opener(_ValidatedRedirects())
     try:
-        with urllib.request.urlopen(request, timeout=params.timeout_seconds) as response:
+        with opener.open(request, timeout=params.timeout_seconds) as response:
             raw = response.read(MAX_HTTP_BODY + 1)
             if len(raw) > MAX_HTTP_BODY:
                 raise ValueError(f"http response exceeds {MAX_HTTP_BODY} bytes")

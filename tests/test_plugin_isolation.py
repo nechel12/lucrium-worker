@@ -11,7 +11,13 @@ from types import SimpleNamespace
 import pytest
 
 from lucrium_worker.logs import LogBuffer
-from lucrium_worker.plugins.host import PluginHost, _parent_pid, _peer_credentials, _sandbox_command
+from lucrium_worker.plugins.host import (
+    PluginHost,
+    _assert_public_url,
+    _parent_pid,
+    _peer_credentials,
+    _sandbox_command,
+)
 from lucrium_worker.storage import Storage
 
 from .conftest import FakeSessions
@@ -26,8 +32,40 @@ def _sandbox_kwargs(tmp_path: Path) -> dict[str, object]:
         "sockets_dir": tmp_path / "data" / "sockets" / "test-plugin",
         "data_dir": tmp_path / "data",
         "config_dir": None,
-        "network": False,
     }
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:8443/",
+        "http://localhost:8443/",
+        "http://10.0.0.5/status",
+        "http://172.16.0.1/",
+        "http://192.168.1.10/admin",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://[::1]/",
+        "http://[::ffff:127.0.0.1]/",
+    ],
+)
+def test_egress_refuses_internal_addresses(url: str) -> None:
+    """Плагин не должен через ctx.http лезть внутрь VPS и в метаданные хостинга."""
+    with pytest.raises(ValueError, match="not a public address"):
+        _assert_public_url(url)
+
+
+def test_egress_refuses_non_http_and_hostless_urls() -> None:
+    with pytest.raises(ValueError, match="must be http"):
+        _assert_public_url("file:///etc/passwd")
+    with pytest.raises(ValueError, match="must be http"):
+        _assert_public_url("gopher://8.8.8.8/")
+    with pytest.raises(ValueError, match="no host"):
+        _assert_public_url("http:///x")
+
+
+@pytest.mark.parametrize("url", ["http://8.8.8.8/", "https://1.1.1.1/x", "https://140.82.121.4/"])
+def test_egress_allows_public_addresses(url: str) -> None:
+    _assert_public_url(url)
 
 
 def test_sandbox_command_requires_the_data_directory(tmp_path: Path) -> None:
