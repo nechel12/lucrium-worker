@@ -18,4 +18,7 @@ jobs:
 
       - name: Verify SSH-signed tag
         run: |
+          # actions/checkout can leave a lightweight local ref; fetch the
+          # annotated tag object before verifying its signature.
+          git fetch --tags --force
           git -c gpg.ssh.allowedSignersFile="$GITHUB_WORKSPACE/security/allowed_signers" verify-tag "$GITHUB_REF_NAME"
