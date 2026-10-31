@@ -79,6 +79,7 @@ from lucrium_protocol import (
     build_response,
     decode_b64,
 )
+from lucrium_protocol.errors import redact_exception_text
 from lucrium_protocol.manifest import ManifestPermissions
 
 from . import __version__
@@ -246,7 +247,9 @@ class WorkerApp:
         except ProtocolError as exc:
             return build_error_response(request, exc)
         except Exception as exc:
-            self.logs.add(LogLevel.ERROR, "worker", f"command {request.payload.method} failed: {exc}")
+            self.logs.add(
+                LogLevel.ERROR, "worker", f"command {request.payload.method} failed: {redact_exception_text(exc)}"
+            )
             return build_error_response(request, ProtocolError.internal(exc))
         return build_response(request, result)
 
@@ -610,10 +613,17 @@ class WorkerApp:
         try:
             validator = jsonschema.Draft202012Validator(schema)
             validator.validate(config)
-        except (jsonschema.ValidationError, jsonschema.SchemaError) as exc:
-            raise ProtocolError(ErrorCode.INVALID_PARAMS, f"invalid config: {exc}") from exc
+        except jsonschema.ValidationError as exc:
+            # str(jsonschema.ValidationError) печатает значение поля — в конфиге
+            # плагины держат свои API-ключи
+            raise ProtocolError(
+                ErrorCode.INVALID_PARAMS,
+                f"invalid config: {exc.json_path} violates {exc.validator}",
+            ) from exc
+        except jsonschema.SchemaError as exc:
+            raise ProtocolError(ErrorCode.INVALID_PARAMS, f"invalid config schema: {type(exc).__name__}") from exc
         except Exception as exc:  # неразрешимый $ref/битая схема плагина
-            raise ProtocolError(ErrorCode.INVALID_PARAMS, f"invalid config schema: {exc}") from exc
+            raise ProtocolError(ErrorCode.INVALID_PARAMS, redact_exception_text(exc)) from exc
 
     # --- состояние ------------------------------------------------------------
 

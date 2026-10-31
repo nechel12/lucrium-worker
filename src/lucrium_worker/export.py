@@ -45,6 +45,7 @@ from lucrium_protocol import (
     PluginSource,
     to_wire,
 )
+from lucrium_protocol.errors import redact_exception_text
 from lucrium_protocol.manifest import ManifestPermissions
 from pydantic import ValidationError
 
@@ -399,7 +400,7 @@ def _parse_account(item: Any) -> AccountRecord:
             desired_running=desired_running,
         )
     except (KeyError, TypeError, ValueError, ValidationError) as exc:
-        raise ExportError(f"invalid account entry: {exc}") from exc
+        raise ExportError(f"invalid account entry: {redact_exception_text(exc)}") from exc
 
 
 def _parse_plugin(item: Any) -> tuple[PluginRecord, dict[str, Any]]:
@@ -442,14 +443,14 @@ def _parse_plugin(item: Any) -> tuple[PluginRecord, dict[str, Any]]:
         )
         return record, dict(data)
     except (KeyError, TypeError, ValueError) as exc:
-        raise ExportError(f"invalid plugin entry: {exc}") from exc
+        raise ExportError(f"invalid plugin entry: {redact_exception_text(exc)}") from exc
 
 
 def _parse_event(item: Any) -> HubEvent:
     try:
         event = HubEvent.model_validate(item)
     except (ValueError, ValidationError) as exc:
-        raise ExportError(f"invalid event entry: {exc}") from exc
+        raise ExportError(f"invalid event entry: {redact_exception_text(exc)}") from exc
     if event.ts.tzinfo is None:
         raise ExportError("event.ts must be timezone-aware")
     return event
