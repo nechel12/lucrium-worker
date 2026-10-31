@@ -60,6 +60,7 @@ from lucrium_protocol import (
     RestartParams,
     RestartResult,
     RestartScope,
+    RevealCredentialsParams,
     RotateTokenParams,
     RotateTokenResult,
     ServerEvent,
@@ -267,7 +268,10 @@ class WorkerApp:
         method = str(payload.method)
         if method == Command.GET_STATE:
             assert isinstance(payload, GetStateParams)
-            return await self.state_with_credentials()
+            return await self.state_snapshot()
+        if method == Command.REVEAL_CREDENTIALS:
+            assert isinstance(payload, RevealCredentialsParams)
+            return await self._reveal_credentials(payload)
         if method == Command.ADD_ACCOUNT:
             assert isinstance(payload, AddAccountParams)
             return await self._add_account(payload)
@@ -659,6 +663,23 @@ class WorkerApp:
             ],
             plugins=[await self._plugin_state(record, include_config=False) for record in plugins],
         )
+
+    async def _reveal_credentials(self, payload: RevealCredentialsParams) -> StateWithCredentials:
+        """Креды по явному запросу — в ``get_state`` их больше нет."""
+        snapshot = await self.state_with_credentials()
+        if payload.account_id is not None:
+            known = {record.id for record in await self.storage.list_accounts()}
+            if payload.account_id not in known:
+                raise ProtocolError(ErrorCode.NOT_FOUND, f"account {payload.account_id!r} is not installed")
+            snapshot = snapshot.model_copy(
+                update={"accounts": [item for item in snapshot.accounts if item.id == payload.account_id]}
+            )
+        self.logs.add(
+            LogLevel.WARNING,
+            "worker",
+            f"credentials revealed for {payload.account_id or 'all accounts'}",
+        )
+        return snapshot
 
     def _account_state(self, record: AccountRecord) -> Any:
         runtime = self.sessions.runtime(record.id)

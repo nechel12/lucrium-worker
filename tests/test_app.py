@@ -25,8 +25,10 @@ from lucrium_protocol import (
     Response,
     RestartParams,
     RestartScope,
+    RevealCredentialsParams,
     SessionStatus,
     SetPluginConfigParams,
+    StateSnapshot,
     StateWithCredentials,
     StopSessionParams,
     UpdateAccountParams,
@@ -62,7 +64,7 @@ async def test_ping(app: WorkerApp) -> None:
     assert result.revision >= 0
 
 
-async def test_add_account_and_get_state_with_credentials(app: WorkerApp) -> None:
+async def test_get_state_hides_credentials_until_revealed(app: WorkerApp) -> None:
     params = AddAccountParams.model_validate(
         {
             "account": {
@@ -78,12 +80,29 @@ async def test_add_account_and_get_state_with_credentials(app: WorkerApp) -> Non
     assert app.sessions.started == [ref.account_id]  # type: ignore[attr-defined]
 
     state = _result(app, await _call(app, Command.GET_STATE, GetStateParams()), Command.GET_STATE)
-    assert isinstance(state, StateWithCredentials)
-    assert state.accounts[0].account.credentials.secret_value() == "gk-live"
+    assert isinstance(state, StateSnapshot)
+    assert state.accounts[0].capabilities  # FunPay: messages/orders/...
+    assert "gk-live" not in state.model_dump_json()
 
-    snapshot = await app.state_snapshot()
-    assert snapshot.accounts[0].capabilities  # FunPay: messages/orders/...
-    assert "gk-live" not in snapshot.model_dump_json()
+    revealed = _result(
+        app,
+        await _call(app, Command.REVEAL_CREDENTIALS, RevealCredentialsParams()),
+        Command.REVEAL_CREDENTIALS,
+    )
+    assert isinstance(revealed, StateWithCredentials)
+    assert revealed.accounts[0].account.credentials.secret_value() == "gk-live"
+    assert any("credentials revealed" in entry.message for entry in app.logs.tail(limit=50))
+
+    single = _result(
+        app,
+        await _call(app, Command.REVEAL_CREDENTIALS, RevealCredentialsParams(account_id=ref.account_id)),
+        Command.REVEAL_CREDENTIALS,
+    )
+    assert [item.id for item in single.accounts] == [ref.account_id]
+
+    missing = await _call(app, Command.REVEAL_CREDENTIALS, RevealCredentialsParams(account_id="acc-absent"))
+    assert missing.payload.error is not None
+    assert missing.payload.error.code is ErrorCode.NOT_FOUND
 
 
 async def test_remove_account_stops_session(app: WorkerApp) -> None:
