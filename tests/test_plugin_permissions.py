@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from lucrium_plugin_sdk.manifest import load_manifest
 from lucrium_protocol import (
     Command,
     ErrorCode,
@@ -23,11 +24,17 @@ from lucrium_protocol import (
     UpdatePluginParams,
     parse_manifest_text,
 )
+from lucrium_protocol.ipc import STORAGE_SET
 
 from lucrium_worker.app import WorkerApp
 from lucrium_worker.logs import LogBuffer
-from lucrium_worker.plugins.host import PluginHost, _PluginProcess, permission_changes
+from lucrium_worker.plugins.host import (
+    PluginHost,
+    _PluginProcess,
+    permission_changes,
+)
 from lucrium_worker.plugins.installer import InstallError, PluginInstaller, _verify_extracted_manifest
+from lucrium_worker.plugins.rpc import PluginRpcError
 from lucrium_worker.storage import PluginRecord, Storage
 
 from .conftest import PLUGIN_MAIN, PLUGIN_SCHEMA, PLUGIN_TOML, FakeSessions, plugin_zip
@@ -84,11 +91,6 @@ async def _no_spawn_start(self: _PluginProcess) -> None:
 
 async def test_kv_params_are_validated_before_touching_storage(tmp_path: Path) -> None:
     """Ключ/значение KV проходят через модели IPC: раньше ключ брали как str(params["key"])."""
-    from lucrium_plugin_sdk.manifest import load_manifest
-    from lucrium_protocol.ipc import STORAGE_SET
-    from lucrium_worker.plugins.host import _PluginProcess
-    from lucrium_worker.plugins.rpc import PluginRpcError
-
     storage = Storage(tmp_path / "lucrium.db", tmp_path / "secret.key")
     await storage.open()
     installer = PluginInstaller(tmp_path / "plugins")
