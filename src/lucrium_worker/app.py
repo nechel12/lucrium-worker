@@ -10,9 +10,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import os
 import platform as platform_module
 import sys
 from collections.abc import Awaitable, Callable, Coroutine
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -92,6 +94,25 @@ from .storage import AccountRecord, PluginRecord, Storage
 Broadcaster = Callable[[Event], Awaitable[None]]
 LogListener = Callable[[Any], None]
 
+_LOCKED_COMMANDS: frozenset[str] = frozenset(
+    command.value
+    for command in (
+        Command.ADD_ACCOUNT,
+        Command.UPDATE_ACCOUNT,
+        Command.REMOVE_ACCOUNT,
+        Command.START_SESSION,
+        Command.STOP_SESSION,
+        Command.INSTALL_PLUGIN,
+        Command.UPDATE_PLUGIN,
+        Command.REMOVE_PLUGIN,
+        Command.SET_PLUGIN_CONFIG,
+        Command.EXPORT_STATE,
+        Command.IMPORT_STATE,
+        Command.ROTATE_TOKEN,
+        Command.RESTART,
+    )
+)
+
 
 class WorkerApp:
     def __init__(self, config: WorkerConfig, *, config_path: Path | None = None) -> None:
@@ -100,7 +121,12 @@ class WorkerApp:
         self.storage = Storage(config.database_path, config.secret_key_path)
         self.logs = LogBuffer()
         self.accounts = AccountService(self.storage)
-        self.sessions = SessionManager(data_dir=config.data_dir, on_event=self._on_hub_event, logs=self.logs)
+        self.sessions = SessionManager(
+            data_dir=config.data_dir,
+            on_event=self._on_hub_event,
+            logs=self.logs,
+            on_change=self._touch,
+        )
         self.installer = PluginInstaller(config.plugins_dir)
         self.plugins = PluginHost(
             plugins_dir=config.plugins_dir,
@@ -127,6 +153,7 @@ class WorkerApp:
         self._background: set[asyncio.Task[None]] = set()
         self._shutdown = asyncio.Event()
         self._closed = False
+        self._command_lock = asyncio.Lock()
 
     # --- жизненный цикл -------------------------------------------------------
 
@@ -147,7 +174,9 @@ class WorkerApp:
         self.logs.set_listener(self._on_log_entry)
         self.logs.set_file(self.config.logs_dir / "worker.log")
         await self._restore_sessions()
-        await self._restore_plugins()
+        # Плагины могут стартовать до 30 секунд каждый; не блокируем ими
+        # запуск WSS-сервера и подключение панели.
+        self._spawn(self._restore_plugins(), "worker-restore-plugins")
         await self._purge_events()
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="worker-heartbeat")
         self._retention_task = asyncio.create_task(self._retention_loop(), name="worker-retention")
@@ -217,6 +246,15 @@ class WorkerApp:
         return build_response(request, result)
 
     async def _dispatch(self, request: Request) -> Any:
+        # Импорт/экспорт и другие мутации сериализуем: у Storage одно SQLite-
+        # соединение, и параллельный commit другой команды мог бы зафиксировать
+        # половину транзакции импорта.
+        if str(request.payload.method) in _LOCKED_COMMANDS:
+            async with self._command_lock:
+                return await self._dispatch_locked(request)
+        return await self._dispatch_locked(request)
+
+    async def _dispatch_locked(self, request: Request) -> Any:
         payload = request.payload
         method = str(payload.method)
         if method == Command.GET_STATE:
@@ -425,9 +463,22 @@ class WorkerApp:
             PluginStatus.CRASHED,
             PluginStatus.RESTARTING,
         }
-        if payload.auto_restart and was_running:
-            await self.plugins.restart(record)
-        self._touch()
+        if payload.auto_restart and record.enabled:
+            try:
+                if was_running:
+                    await self.plugins.restart(record)
+                else:
+                    await self.plugins.start(record)
+            except Exception as exc:
+                self.logs.add(
+                    LogLevel.ERROR,
+                    record.id,
+                    f"plugin updated but cannot start: {type(exc).__name__}: {exc}",
+                )
+            finally:
+                self._touch()
+        else:
+            self._touch()
         return await self._plugin_state(record)
 
     async def _remove_plugin(self, payload: RemovePluginParams) -> PluginRef:
@@ -460,16 +511,39 @@ class WorkerApp:
             updated_at=datetime.now(UTC),
         )
         await self.storage.upsert_plugin(record)
-        restart_triggered = self.plugins.status(record.id) in {
+        current_status = self.plugins.status(record.id)
+        restart_triggered = record.enabled and current_status in {
             PluginStatus.RUNNING,
             PluginStatus.STARTING,
+            PluginStatus.STOPPING,
             PluginStatus.CRASHED,
             PluginStatus.RESTARTING,
         }
-        if restart_triggered:
-            await self.plugins.restart(record)
-        self._touch()
-        return PluginConfigResult(plugin_id=record.id, restart_triggered=restart_triggered)
+        start_from_stopped = record.enabled and current_status in {
+            PluginStatus.STOPPED,
+            PluginStatus.INSTALLED,
+        }
+        try:
+            if restart_triggered:
+                await self.plugins.restart(record)
+            elif start_from_stopped:
+                await self.plugins.start(record)
+                restart_triggered = True
+        except Exception as exc:
+            # Конфиг уже сохранён; показываем ошибку через состояние плагина,
+            # а не превращаем set_plugin_config в отказ.
+            restart_triggered = False
+            self.logs.add(
+                LogLevel.ERROR,
+                record.id,
+                f"config saved but plugin cannot start: {type(exc).__name__}: {exc}",
+            )
+        finally:
+            self._touch()
+        return PluginConfigResult(
+            plugin_id=record.id,
+            restart_triggered=restart_triggered,
+        )
 
     async def _call_client(self, payload: CallClientParams) -> CallClientResult:
         """Вызов клиента aiosellers из панели (лоты/товары, §9)."""
@@ -640,6 +714,8 @@ class WorkerApp:
         task.add_done_callback(self._background.discard)
 
     def _touch(self) -> None:
+        if self._closed:
+            return
         self._revision += 1
         if self._state_task is not None and not self._state_task.done():
             return
@@ -713,19 +789,31 @@ class WorkerApp:
     def _rotate_token(self) -> RotateTokenResult:
         from .config import generate_token
 
+        if os.environ.get("LUCRIUM_TOKEN"):
+            raise ProtocolError(
+                ErrorCode.CONFLICT,
+                "pairing token is managed by LUCRIUM_TOKEN; update the environment variable instead",
+            )
         token = generate_token()
-        self._token = token
         if self.config_path is not None:
-            from dataclasses import replace
-
-            self.config = replace(self.config, token=token)
-            self.config.save(self.config_path)
+            new_config = replace(self.config, token=token)
+            try:
+                # Сначала фиксируем на диске: если запись не удалась, старый
+                # токен остаётся действующим и панель не теряет доступ.
+                new_config.save(self.config_path)
+            except Exception as exc:
+                raise ProtocolError(
+                    ErrorCode.UNAVAILABLE,
+                    f"cannot persist new pairing token: {type(exc).__name__}: {exc}",
+                ) from exc
+            self.config = new_config
+        self._token = token
         self.logs.add(LogLevel.WARNING, "worker", "pairing token rotated")
         return RotateTokenResult(token=token, rotated_at=datetime.now(UTC))
 
     async def _restart(self, payload: RestartParams) -> RestartResult:
         if payload.scope is RestartScope.SESSIONS:
-            records = await self.storage.list_accounts()
+            records = [record for record in await self.storage.list_accounts() if record.desired_running]
             await self.sessions.stop_all()
             for record in records:
                 await self.sessions.start(record)

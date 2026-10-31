@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -98,11 +99,17 @@ class SessionManager:
         data_dir: Path,
         on_event: EventHandler,
         logs: LogBuffer,
+        on_change: Callable[[], None] | None = None,
     ) -> None:
         self._data_dir = data_dir
         self._on_event = on_event
         self._logs = logs
+        self._on_change = on_change
         self._runtimes: dict[str, SessionRuntime] = {}
+
+    def _notify_change(self) -> None:
+        if self._on_change is not None:
+            self._on_change()
 
     # --- запросы --------------------------------------------------------------
 
@@ -202,6 +209,7 @@ class SessionManager:
                 )
         runtime.status = SessionStatus.STOPPED
         self._runtimes.pop(account_id, None)
+        self._notify_change()
 
     async def stop_all(self) -> None:
         await asyncio.gather(*(self.stop(account_id) for account_id in list(self._runtimes)), return_exceptions=True)
@@ -213,17 +221,20 @@ class SessionManager:
         while not runtime.stopping:
             state: SQLiteStateStore | None = None
             hub = SellerHub()
+            running_since: float | None = None
             try:
                 state = SQLiteStateStore(self._data_dir / "sessions" / f"{record.id}.db")
                 runtime.state_store = state
                 runtime.status = SessionStatus.STARTING
+                self._notify_change()
                 client = build_client(record, state)
                 runtime.client = client
                 hub.add(client, platform=record.platform.value, session_id=record.id)
                 await hub.start()
                 runtime.status = SessionStatus.RUNNING
                 runtime.last_error = None
-                backoff = BACKOFF_START
+                running_since = time.monotonic()
+                self._notify_change()
                 self._logs.add(
                     LogLevel.INFO, "worker", f"session {record.id} started", {"platform": record.platform.value}
                 )
@@ -234,9 +245,14 @@ class SessionManager:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if running_since is not None and time.monotonic() - running_since >= BACKOFF_RESET_AFTER:
+                    # Сессия была стабильной: следующую серию ошибок начинаем
+                    # снова с короткой паузы.
+                    backoff = BACKOFF_START
                 runtime.status = SessionStatus.ERROR
                 runtime.last_error = f"{type(exc).__name__}: {exc}"[:2000]
                 runtime.restarts += 1
+                self._notify_change()
                 self._logs.add(
                     LogLevel.ERROR,
                     "worker",

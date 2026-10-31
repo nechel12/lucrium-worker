@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import gzip
@@ -112,6 +113,11 @@ async def export_state(
     if include_history:
         payload["events"] = [_event_payload(event) for event in events]
 
+    return await asyncio.to_thread(_encode_state_dump, payload, passphrase)
+
+
+def _encode_state_dump(payload: dict[str, Any], passphrase: str) -> ExportStateResult:
+    """CPU-тяжёлая часть экспорта (gzip/PBKDF2/Fernet) вне event loop."""
     raw = gzip.compress(json.dumps(payload, ensure_ascii=False).encode("utf-8"), mtime=0)
     blob = encrypt_blob(raw, passphrase)
     blob_b64 = base64.b64encode(blob).decode()

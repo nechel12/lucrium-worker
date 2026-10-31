@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
+from pathlib import Path
 from typing import Any
 
+import pytest
 from lucrium_protocol import (
     AddAccountParams,
     CallClientParams,
@@ -21,6 +23,8 @@ from lucrium_protocol import (
     PingParams,
     RemoveAccountParams,
     Response,
+    RestartParams,
+    RestartScope,
     SessionStatus,
     SetPluginConfigParams,
     StateWithCredentials,
@@ -34,6 +38,7 @@ from lucrium_protocol import (
 from pydantic import SecretStr
 
 from lucrium_worker.app import WorkerApp
+from lucrium_worker.config import WorkerConfig
 
 from .conftest import PLUGIN_MAIN, PLUGIN_SCHEMA, PLUGIN_TOML, make_zip, plugin_zip
 
@@ -219,6 +224,37 @@ async def test_rotate_token(app: WorkerApp) -> None:
     assert app.token == result.token
 
 
+async def test_rotate_token_does_not_swap_token_when_persist_fails(
+    app: WorkerApp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from lucrium_protocol import RotateTokenParams
+
+    app.config_path = tmp_path / "worker.toml"
+    old = app.token
+
+    def fail_save(self: WorkerConfig, path: str | Path) -> Path:
+        raise OSError("read-only config dir")
+
+    monkeypatch.setattr(WorkerConfig, "save", fail_save)
+    response = await _call(app, Command.ROTATE_TOKEN, RotateTokenParams())
+    assert response.payload.error is not None
+    assert response.payload.error.code is ErrorCode.UNAVAILABLE
+    assert app.token == old
+
+
+async def test_rotate_token_refuses_env_managed_token(
+    app: WorkerApp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from lucrium_protocol import RotateTokenParams
+
+    old = app.token
+    monkeypatch.setenv("LUCRIUM_TOKEN", old)
+    response = await _call(app, Command.ROTATE_TOKEN, RotateTokenParams())
+    assert response.payload.error is not None
+    assert response.payload.error.code is ErrorCode.CONFLICT
+    assert app.token == old
+
+
 async def test_export_import_via_commands(app: WorkerApp) -> None:
     add = AddAccountParams.model_validate(
         {
@@ -334,6 +370,33 @@ async def test_update_account_restarts_error_session(app: WorkerApp) -> None:
     )
     assert len(app.sessions.started) == started_before + 1  # type: ignore[attr-defined]
     assert ref.account_id in app.sessions.stopped  # type: ignore[attr-defined]
+
+
+async def test_restart_sessions_respects_desired_running(app: WorkerApp) -> None:
+    ids: list[str] = []
+    for label in ("one", "two"):
+        add = AddAccountParams.model_validate(
+            {
+                "account": {
+                    "platform": "funpay",
+                    "label": label,
+                    "credentials": {"platform": "funpay", "golden_key": "gk"},
+                }
+            }
+        )
+        ids.append(_result(app, await _call(app, Command.ADD_ACCOUNT, add), Command.ADD_ACCOUNT).account_id)
+    _result(
+        app,
+        await _call(app, Command.STOP_SESSION, StopSessionParams(account_id=ids[1])),
+        Command.STOP_SESSION,
+    )
+    app.sessions.started.clear()  # type: ignore[attr-defined]
+    _result(
+        app,
+        await _call(app, Command.RESTART, RestartParams(scope=RestartScope.SESSIONS)),
+        Command.RESTART,
+    )
+    assert app.sessions.started == [ids[0]]  # type: ignore[attr-defined]
 
 
 async def test_get_logs_returns_latest_entries(app: WorkerApp) -> None:

@@ -163,9 +163,14 @@ class PluginHost:
         self._processes[record.id] = process
         try:
             await process.start()
-        except Exception:
-            self._processes.pop(record.id, None)
-            self._last_errors[record.id] = process.last_error or "plugin failed to start"
+        except Exception as exc:
+            error = process.last_error or f"{type(exc).__name__}: {exc}"
+            self._last_errors[record.id] = error[:2000]
+            process.last_error = error[:2000]
+            process.status = PluginStatus.CRASHED
+            # Не теряем процесс: on_start может упасть из-за временной причины
+            # или конфига, который пользователь сейчас исправит. Ретраим с backoff.
+            self._schedule_restart(process, error)
             self._notify_change()
             raise
         self._last_errors.pop(record.id, None)
@@ -281,6 +286,13 @@ class _PluginProcess:
         self.stopping = False
         self.status = PluginStatus.STARTING
         self.last_error = None
+        # После краха/рестарта в очереди могут остаться события прошлого
+        # процесса: не отдаём их новому экземпляру плагина.
+        while True:
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         with contextlib.suppress(OSError):
             self.socket_path.parent.chmod(0o700)

@@ -54,6 +54,27 @@ async def test_unknown_session_rejected(manager: SessionManager) -> None:
         await manager.call("acc-missing", "chats.send_message", {})
 
 
+async def test_stop_notifies_status_change(tmp_path: Path) -> None:
+    changes: list[bool] = []
+
+    async def on_event(event: HubEvent) -> None:
+        return None
+
+    manager = SessionManager(
+        data_dir=tmp_path,
+        on_event=on_event,
+        logs=LogBuffer(),
+        on_change=lambda: changes.append(True),
+    )
+    manager._runtimes["acc-1"] = SessionRuntime(
+        account_id="acc-1",
+        platform=Platform.FUNPAY,
+        status=SessionStatus.RUNNING,
+    )
+    await manager.stop("acc-1")
+    assert changes == [True]
+
+
 async def test_private_and_unknown_roots_rejected(manager: SessionManager) -> None:
     with pytest.raises(SessionError, match="not allowed"):
         await manager.call("acc-1", "_require", {})
@@ -81,7 +102,7 @@ async def test_financial_methods_require_opt_in(manager: SessionManager) -> None
     client.deals = SimpleNamespace(cancel=lambda **_: {"cancelled": True})
 
     for method in ("finance.withdraw", "finance.save_wallets", "orders.refund", "deals.cancel"):
-        with pytest.raises(SessionError, match="permissions.finance"):
+        with pytest.raises(SessionError, match=r"permissions\.finance"):
             await manager.call("acc-1", method, {})
 
     assert await manager.call("acc-1", "finance.withdraw", {}, allow_finance=True) == {"withdrawn": True}
