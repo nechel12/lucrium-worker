@@ -371,6 +371,8 @@ class _PluginProcess:
         self.status = PluginStatus.STOPPING
         for task in self._tasks:
             task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
         if self._peer is not None:
             with contextlib.suppress(Exception):
@@ -378,16 +380,21 @@ class _PluginProcess:
             self._peer = None
         process = self._process
         self._process = None
-        if process is not None and process.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5)
-            except TimeoutError:
+        if process is not None:
+            if process.returncode is None:
                 with contextlib.suppress(ProcessLookupError):
-                    process.kill()
-                with contextlib.suppress(Exception):
-                    await process.wait()
+                    process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                except TimeoutError:
+                    with contextlib.suppress(ProcessLookupError):
+                        process.kill()
+                    with contextlib.suppress(Exception):
+                        await process.wait()
+            # communicate() drains and closes stdout/stderr pipes; process.wait()
+            # alone leaves the transports open on Python 3.14.
+            with contextlib.suppress(Exception):
+                await process.communicate()
         if self._server is not None:
             self._server.close()
             with contextlib.suppress(Exception):

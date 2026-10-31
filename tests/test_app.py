@@ -112,7 +112,13 @@ async def test_install_plugin_without_start(app: WorkerApp) -> None:
     assert (app.config.plugins_dir / "test-plugin" / "plugin.toml").is_file()
 
 
-async def test_set_plugin_config_validates_schema(app: WorkerApp) -> None:
+async def test_set_plugin_config_validates_schema(app: WorkerApp, monkeypatch: pytest.MonkeyPatch) -> None:
+    started: list[str] = []
+
+    async def fake_start(record: Any) -> None:
+        started.append(record.id)
+
+    monkeypatch.setattr(app.plugins, "start", fake_start)
     install = InstallPluginParams(archive_b64=base64.b64encode(plugin_zip()).decode(), auto_start=False)
     _result(app, await _call(app, Command.INSTALL_PLUGIN, install), Command.INSTALL_PLUGIN)
 
@@ -123,7 +129,8 @@ async def test_set_plugin_config_validates_schema(app: WorkerApp) -> None:
 
     good = SetPluginConfigParams(plugin_id="test-plugin", config={"greeting": "Привет"})
     result = _result(app, await _call(app, Command.SET_PLUGIN_CONFIG, good), Command.SET_PLUGIN_CONFIG)
-    assert result.restart_triggered is False
+    assert result.restart_triggered is True
+    assert started == ["test-plugin"]
 
 
 async def test_get_plugin_schema(app: WorkerApp) -> None:
