@@ -563,7 +563,7 @@ wheels = [
 
 [[package]]
 name = "lucrium-plugin-sdk"
-version = "0.1.0"
+version = "0.1.2"
 source = { editable = "../lucrium-protocol/packages/lucrium-plugin-sdk" }
 dependencies = [
     { name = "lucrium-protocol" },
@@ -574,7 +574,7 @@ requires-dist = [{ name = "lucrium-protocol", editable = "../lucrium-protocol/pa
 
 [[package]]
 name = "lucrium-protocol"
-version = "0.1.0"
+version = "0.1.2"
 source = { editable = "../lucrium-protocol/packages/lucrium-protocol" }
 dependencies = [
     { name = "pydantic" },
@@ -589,7 +589,7 @@ requires-dist = [
 
 [[package]]
 name = "lucrium-worker"
-version = "0.1.0"
+version = "0.1.2"
 source = { editable = "." }
 dependencies = [
     { name = "aiosellers-nechel12" },

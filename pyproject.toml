@@ -1,6 +1,6 @@
 [project]
 name = "lucrium-worker"
-version = "0.1.0"
+version = "0.1.2"
 description = "Lucrium Worker — демон для Linux VPS: сессии FunPay/PlayerOK/GGsel, host плагинов, WSS для панели"
 readme = "README.md"
 requires-python = ">=3.12"
