@@ -123,9 +123,11 @@ def test_peer_credentials_report_the_other_end() -> None:
         credentials = _peer_credentials(writer)  # type: ignore[arg-type]
         assert credentials is not None
         pid, uid = credentials
-        # на socketpair «пир» — мы сами
+        # на socketpair «пир» — мы сами; pid нулевым быть не может
         assert pid == os.getpid()
         assert uid == os.getuid()
+        # а мёртвое соединение не должно ронять проверку
+        assert _peer_credentials(SimpleNamespace(get_extra_info=lambda _name: None)) is None
         assert _parent_pid(os.getpid()) == os.getppid()
 
 

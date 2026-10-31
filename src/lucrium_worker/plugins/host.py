@@ -766,10 +766,11 @@ def _peer_credentials(writer: asyncio.StreamWriter) -> tuple[int, int] | None:
     if sock is None:
         return None
     try:
-        raw = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.pack("3i", 0, 0, 0))
-    except OSError:
+        # третий аргумент getsockopt — размер буфера, а не заполненные байты
+        raw = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        pid, uid, _gid = struct.unpack("3i", raw)
+    except (OSError, ValueError, struct.error):
         return None
-    pid, uid, _gid = struct.unpack("3i", raw)
     return pid, uid
 
 
