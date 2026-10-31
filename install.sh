@@ -10,6 +10,8 @@
 #   LUCRIUM_DATA_DIR=/var/lib/lucrium
 #   LUCRIUM_USER=lucrium
 #   LUCRIUM_TLS=1                сгенерировать самоподписанный сертификат
+#   LUCRIUM_TLS_LIBRARY=/path/to/libtls-client.so
+#                                готовый native tls_requests library (иначе скачается)
 #   LUCRIUM_REPO_URL, LUCRIUM_PROTOCOL_URL — альтернативные git-адреса
 set -euo pipefail
 
@@ -26,31 +28,37 @@ PROTOCOL_URL="${LUCRIUM_PROTOCOL_URL:-https://github.com/nechel12/lucrium-protoc
 REF="${LUCRIUM_REF:-main}"
 RELEASE_SIGNING_PUBKEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILBugtb8eBzKbNrkbJ1GH9h0NPIGtm3LTODxg6iprSGW lucrium-release"
 CONFIG_FILE="$CONFIG_DIR/worker.toml"
+PYTHON_DIR="$INSTALL_DIR/python"
+TLS_DIR="$INSTALL_DIR/tls"
+# Python и native TLS library должны быть доступны пользователю службы:
+# /root для него закрыт (и ProtectHome), а /opt читается под ProtectSystem=strict.
+export UV_PYTHON_INSTALL_DIR="$PYTHON_DIR"
 
 log() { printf '\033[1;34m[lucrium]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[lucrium] error:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo bash install.sh)"
 command -v systemctl >/dev/null || die "systemd is required"
-command -v git >/dev/null || die "git is required"
 
 install_packages() {
   if command -v apt-get >/dev/null; then
     apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 python3-venv python3-pip curl ca-certificates openssl
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git python3 python3-venv python3-pip curl ca-certificates openssl
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bubblewrap || log "bubblewrap unavailable; plugin sandbox disabled"
   elif command -v dnf >/dev/null; then
-    dnf install -y -q python3 python3-pip curl ca-certificates openssl
+    dnf install -y -q git python3 python3-pip curl ca-certificates openssl
     dnf install -y -q bubblewrap || log "bubblewrap unavailable; plugin sandbox disabled"
   elif command -v yum >/dev/null; then
-    yum install -y -q python3 python3-pip curl ca-certificates openssl
+    yum install -y -q git python3 python3-pip curl ca-certificates openssl
     yum install -y -q bubblewrap || log "bubblewrap unavailable; plugin sandbox disabled"
   else
-    log "unknown package manager; assuming curl/openssl are installed"
+    log "unknown package manager; assuming git/curl/openssl are installed"
   fi
 }
 
 install_packages
+command -v git >/dev/null || die "git is required"
+command -v openssl >/dev/null || log "warning: openssl is missing; TLS certificate will not be generated"
 
 # Публичный адрес нужен и для SAN сертификата, и для итогового вывода.
 IP="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
@@ -70,8 +78,15 @@ if ! command -v uv >/dev/null; then
 fi
 command -v uv >/dev/null || die "uv installation failed"
 
+mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR"
+case "$CONFIG_DIR" in
+  "/"|"/etc"|"/usr"|"/var"|"/home"|"/root"|"/opt"|"/bin"|"/sbin")
+    die "LUCRIUM_CONFIG_DIR must be a dedicated directory, got $CONFIG_DIR"
+    ;;
+esac
+
 log "installing Python $PYTHON_VERSION (uv-managed)"
-uv python install "$PYTHON_VERSION" >/dev/null || die "cannot install Python $PYTHON_VERSION"
+uv python install --no-bin "$PYTHON_VERSION" >/dev/null || die "cannot install Python $PYTHON_VERSION"
 
 if ! id "$SERVICE_USER" >/dev/null 2>&1; then
   log "creating service user $SERVICE_USER"
@@ -79,7 +94,10 @@ if ! id "$SERVICE_USER" >/dev/null 2>&1; then
     || useradd --system --home "$INSTALL_DIR" --shell /sbin/nologin "$SERVICE_USER"
 fi
 
-mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR"
+# Панель ротирует токен через config.save(): службе нужен write на каталог
+# конфига, а не только на сам worker.toml.
+chown "$SERVICE_USER:$SERVICE_USER" "$CONFIG_DIR"
+chmod 700 "$CONFIG_DIR"
 
 verify_release_tag() {
   local target="$1" ref="$2" allowed
@@ -126,9 +144,56 @@ clone_or_update "$WORKER_URL" "$INSTALL_DIR/lucrium-worker"
 
 log "syncing python environment"
 (cd "$INSTALL_DIR/lucrium-worker" && uv sync --quiet --frozen --python "$PYTHON_VERSION")
+chmod -R a+rX "$PYTHON_DIR" "$INSTALL_DIR/lucrium-worker/.venv"
 
 WORKER_BIN="$INSTALL_DIR/lucrium-worker/.venv/bin/lucrium-worker"
+VENV_PYTHON="$INSTALL_DIR/lucrium-worker/.venv/bin/python"
 [ -x "$WORKER_BIN" ] || die "worker entrypoint not found: $WORKER_BIN"
+
+run_as_service() {
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u "$SERVICE_USER" -- "$@"
+  else
+    su -s /bin/sh "$SERVICE_USER" -c "$(printf '%q ' "$@")"
+  fi
+}
+
+# aiosellers ходит через tls_requests, который не содержит native library в
+# wheel и скачивает её в site-packages при первом запросе. Под ProtectSystem=strict
+# и root-owned venv запись невозможна, поэтому библиотеку готовим заранее.
+log "preparing tls_requests native library"
+mkdir -p "$TLS_DIR"
+if [ -n "${LUCRIUM_TLS_LIBRARY:-}" ]; then
+  [ -f "$LUCRIUM_TLS_LIBRARY" ] || die "LUCRIUM_TLS_LIBRARY not found: $LUCRIUM_TLS_LIBRARY"
+  TLS_LIBRARY_PATH="$TLS_DIR/$(basename "$LUCRIUM_TLS_LIBRARY")"
+  cp -f "$LUCRIUM_TLS_LIBRARY" "$TLS_LIBRARY_PATH"
+else
+  TLS_LIBRARY_PATH="$(
+    "$VENV_PYTHON" - "$TLS_DIR" <<'PY'
+import contextlib
+import io
+import shutil
+import sys
+from pathlib import Path
+
+from tls_requests.models.libraries import TLSLibrary
+
+destination_dir = Path(sys.argv[1])
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    path = TLSLibrary.download()
+if not path:
+    raise SystemExit("TLSLibrary.download() returned no path")
+destination = destination_dir / Path(path).name
+shutil.copy2(path, destination)
+print(destination)
+PY
+  )" || die "cannot download tls_requests native library; set LUCRIUM_TLS_LIBRARY=/path/to/libtls-client.so"
+fi
+chmod 755 "$TLS_DIR"
+chmod 644 "$TLS_LIBRARY_PATH"
+run_as_service env TLS_LIBRARY_PATH="$TLS_LIBRARY_PATH" "$VENV_PYTHON" -c \
+  "from tls_requests.models.libraries import TLSLibrary; TLSLibrary.load(); print('tls library ok')" \
+  || die "tls_requests library is not loadable by $SERVICE_USER (check TLS_LIBRARY_PATH/permissions)"
 
 FINGERPRINT=""
 FRESH=0
@@ -188,6 +253,7 @@ Wants=network-online.target
 Type=simple
 User=$SERVICE_USER
 Group=$SERVICE_USER
+Environment="TLS_LIBRARY_PATH=$TLS_LIBRARY_PATH"
 WorkingDirectory="$INSTALL_DIR/lucrium-worker"
 ExecStart="$WORKER_BIN" run --config "$CONFIG_FILE"
 Restart=always
@@ -205,15 +271,29 @@ EOF
 
 systemctl daemon-reload
 systemctl enable lucrium-worker.service >/dev/null
-systemctl restart lucrium-worker.service
+if ! systemctl restart lucrium-worker.service; then
+  systemctl status lucrium-worker.service --no-pager -l || true
+  journalctl -u lucrium-worker.service -n 50 --no-pager || true
+  die "worker service failed to start"
+fi
+for _ in $(seq 1 10); do
+  systemctl is-active --quiet lucrium-worker.service && break
+  sleep 1
+done
+if ! systemctl is-active --quiet lucrium-worker.service; then
+  systemctl status lucrium-worker.service --no-pager -l || true
+  journalctl -u lucrium-worker.service -n 50 --no-pager || true
+  die "worker service is not active; check the logs above"
+fi
 
 TOKEN="$("$WORKER_BIN" show-token --config "$CONFIG_FILE")"
 SCHEME="ws"; [ "$TLS_ENABLED" = "1" ] && [ -f "$CONFIG_DIR/tls/cert.pem" ] && SCHEME="wss"
+URL_HOST="$IP"; case "$IP" in *:*) URL_HOST="[$IP]" ;; esac
 
 echo
 echo "============================================================"
 echo " Lucrium Worker установлен и запущен"
-echo "   Адрес: $SCHEME://$IP:$PORT"
+echo "   Адрес: $SCHEME://$URL_HOST:$PORT"
 if [ "$FRESH" = "1" ]; then
   echo "   Токен: $TOKEN"
 else

@@ -26,6 +26,12 @@ curl -fsSL https://raw.githubusercontent.com/nechel12/lucrium-worker/main/instal
 Его нужно вставить в панели: проверка TLS включена по умолчанию, а fingerprint
 даёт защиту от MITM без отключения проверки.
 
+Установщик также заранее готовит native-библиотеку для `tls_requests` (её
+использует `aiosellers`) и прописывает `TLS_LIBRARY_PATH` в systemd: при
+`ProtectSystem=strict` и root-owned venv скачивание в `site-packages` при
+первом запросе невозможно. Если GitHub с VPS недоступен, скачайте библиотеку
+вручную и передайте путь: `LUCRIUM_TLS_LIBRARY=/path/to/tls-client.so bash install.sh`.
+
 ## CLI
 
 ```bash
