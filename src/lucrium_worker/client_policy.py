@@ -41,7 +41,6 @@ _PANEL_METHODS = frozenset(
         "lots.save",
         "lots.upload_offer_image",
         "items.get",
-        "items.iter_self",
         "items.list_self",
         "items.publish",
         "items.remove",
