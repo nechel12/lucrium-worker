@@ -242,9 +242,7 @@ async def test_rotate_token_does_not_swap_token_when_persist_fails(
     assert app.token == old
 
 
-async def test_rotate_token_refuses_env_managed_token(
-    app: WorkerApp, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_rotate_token_refuses_env_managed_token(app: WorkerApp, monkeypatch: pytest.MonkeyPatch) -> None:
     from lucrium_protocol import RotateTokenParams
 
     old = app.token
