@@ -14,6 +14,7 @@ import sys
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,7 @@ from lucrium_protocol.ipc import (
     StartParams,
     StopParams,
 )
+from lucrium_protocol.manifest import ManifestPermissions
 
 from ..logs import LogBuffer
 from ..sessions import SessionError, SessionManager
@@ -67,6 +69,20 @@ BACKOFF_MAX = 60.0
 
 ErrorCallback = Callable[[PluginError], None]
 ChangeCallback = Callable[[], None]
+
+
+def permission_changes(stored: ManifestPermissions, actual: ManifestPermissions) -> list[str]:
+    """Чем манифест на диске отличается от зафиксированного при установке."""
+    changes: list[str] = []
+    installed_accounts = sorted(platform.value for platform in stored.accounts) or ["all"]
+    actual_accounts = sorted(platform.value for platform in actual.accounts) or ["all"]
+    if installed_accounts != actual_accounts:
+        changes.append(f"accounts: installed {installed_accounts}, files declare {actual_accounts}")
+    if actual.network != stored.network:
+        changes.append(f"network: installed {stored.network}, files declare {actual.network}")
+    if actual.finance != stored.finance:
+        changes.append(f"finance: installed {stored.finance}, files declare {actual.finance}")
+    return changes
 
 
 class PluginHost:
@@ -153,6 +169,20 @@ class PluginHost:
         except Exception as exc:
             self._last_errors[record.id] = f"{type(exc).__name__}: {exc}"[:2000]
             raise
+        if manifest.id != record.id:
+            message = f"manifest declares id {manifest.id!r}, installed as {record.id!r}"
+            self._last_errors[record.id] = message
+            raise RuntimeError(message)
+        if record.permissions is None:
+            # запись оставлена старой версией воркера: фиксируем то, что на диске
+            record = replace(record, permissions=manifest.permissions)
+            await self._storage.upsert_plugin(record)
+        else:
+            changes = permission_changes(record.permissions, manifest.permissions)
+            if changes:
+                message = "plugin files changed permissions without reinstall: " + "; ".join(changes)
+                self._last_errors[record.id] = message
+                raise RuntimeError(message)
         process = _PluginProcess(
             record=record,
             manifest=manifest,
@@ -745,4 +775,5 @@ __all__ = [
     "START_TIMEOUT",
     "STOP_TIMEOUT",
     "PluginHost",
+    "permission_changes",
 ]

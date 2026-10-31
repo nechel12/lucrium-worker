@@ -3,6 +3,8 @@
 Архив обязан содержать ``plugin.toml`` либо в корне, либо в единственном
 каталоге верхнего уровня (типичный GitHub-zip). Манифест и JSON-схема
 валидируются до распаковки в рабочий каталог; zip-slip и zip-bomb отсекаются.
+Дубликаты имён членов запрещены, а распакованный манифест сверяется с
+проверенным: разрешения плагин получает из файлов на диске.
 """
 
 from __future__ import annotations
@@ -75,6 +77,7 @@ class PluginInstaller:
                 staging = self._plugins_dir / f".staging-{uuid.uuid4().hex}"
                 try:
                     self._extract(zf, members, root, staging)
+                    _verify_extracted_manifest(staging, manifest)
                     schema = load_config_schema(staging, manifest)
                     if schema is not None:
                         jsonschema.Draft202012Validator.check_schema(schema)
@@ -132,8 +135,13 @@ def _safe_members(zf: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
     if len(members) > MAX_FILES:
         raise InstallError(f"archive has too many files ({len(members)} > {MAX_FILES})")
     total = 0
+    seen: set[str] = set()
     for info in members:
         name = info.filename
+        if name in seen:
+            # два члена с одним именем: валидируется первый, на диске остаётся последний
+            raise InstallError(f"duplicate archive entry: {name!r}")
+        seen.add(name)
         path = PurePosixPath(name)
         if path.is_absolute() or ".." in path.parts or name.startswith("\\"):
             raise InstallError(f"unsafe path in archive: {name!r}")
@@ -174,6 +182,30 @@ def _read_manifest(zf: zipfile.ZipFile, members: list[zipfile.ZipInfo], root: st
         return parse_manifest_text(text)
     except ManifestError as exc:
         raise InstallError(f"invalid manifest: {exc}") from exc
+
+
+def _verify_extracted_manifest(staging: Path, expected: PluginManifest) -> None:
+    """Сверить распакованный ``plugin.toml`` с проверенным из архива.
+
+    Разрешения плагина читаются с диска при каждом старте, поэтому решение,
+    принятое по одному манифесту, не должно относиться к другому файлу.
+    """
+    path = staging / MANIFEST_FILENAME
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise InstallError(f"{MANIFEST_FILENAME} unreadable after extraction: {exc}") from exc
+    try:
+        actual = parse_manifest_text(text)
+    except ManifestError as exc:
+        raise InstallError(f"{MANIFEST_FILENAME} changed during extraction: {exc}") from exc
+    if actual != expected:
+        raise InstallError(
+            f"{MANIFEST_FILENAME} on disk differs from the validated archive entry "
+            f"(validated {expected.id!r} {expected.version!r} network={expected.permissions.network} "
+            f"finance={expected.permissions.finance}, extracted {actual.id!r} {actual.version!r} "
+            f"network={actual.permissions.network} finance={actual.permissions.finance})"
+        )
 
 
 def _relative_name(info: zipfile.ZipInfo, root: str) -> Path | None:

@@ -18,8 +18,9 @@ from typing import Any
 import aiosqlite
 from cryptography.fernet import Fernet, InvalidToken
 from lucrium_protocol import AccountCredentials, EventKind, HubEvent, Platform, PluginSource, ProxyConfig, to_wire
+from lucrium_protocol.manifest import ManifestPermissions
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _SEALED_PREFIX = "enc1:"
 
 
@@ -50,6 +51,12 @@ class PluginRecord:
     config: dict[str, Any]
     installed_at: datetime
     updated_at: datetime
+    permissions: ManifestPermissions | None = None
+    """Разрешения из манифеста на момент установки.
+
+    ``None`` — запись создана старой версией воркера; при первом старте их
+    подтягивают с диска. Расхождение с тем, что читает host, блокирует запуск.
+    """
 
     @property
     def path(self) -> str:
@@ -81,7 +88,8 @@ CREATE TABLE IF NOT EXISTS plugins (
     enabled INTEGER NOT NULL,
     config_json TEXT NOT NULL,
     installed_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    permissions_json TEXT
 );
 CREATE TABLE IF NOT EXISTS plugin_kv (
     plugin_id TEXT NOT NULL,
@@ -162,6 +170,10 @@ class Storage:
         columns = {str(row["name"]) for row in await cursor.fetchall()}
         if "desired_running" not in columns:
             await self.db.execute("ALTER TABLE accounts ADD COLUMN desired_running INTEGER NOT NULL DEFAULT 1")
+        cursor = await self.db.execute("PRAGMA table_info(plugins)")
+        columns = {str(row["name"]) for row in await cursor.fetchall()}
+        if "permissions_json" not in columns:
+            await self.db.execute("ALTER TABLE plugins ADD COLUMN permissions_json TEXT")
 
     async def _migrate_sealed_columns(self) -> None:
         """Шифрует секреты, сохранённые старыми версиями в открытом виде."""
@@ -302,8 +314,11 @@ class Storage:
     async def upsert_plugin(self, record: PluginRecord, *, commit: bool = True) -> None:
         await self.db.execute(
             """
-            INSERT INTO plugins (id, name, version, api, source, enabled, config_json, installed_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO plugins (
+                id, name, version, api, source, enabled, config_json, installed_at, updated_at,
+                permissions_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 version = excluded.version,
@@ -311,7 +326,8 @@ class Storage:
                 source = excluded.source,
                 enabled = excluded.enabled,
                 config_json = excluded.config_json,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                permissions_json = excluded.permissions_json
             """,
             (
                 record.id,
@@ -323,6 +339,9 @@ class Storage:
                 self._seal_json(record.config),
                 _iso(record.installed_at),
                 _iso(record.updated_at),
+                None
+                if record.permissions is None
+                else json.dumps(record.permissions.model_dump(mode="json"), ensure_ascii=False),
             ),
         )
         if commit:
@@ -346,6 +365,11 @@ class Storage:
             config=self._open_secret_json(str(row["config_json"])),
             installed_at=_parse_dt(row["installed_at"]),
             updated_at=_parse_dt(row["updated_at"]),
+            permissions=(
+                None
+                if row["permissions_json"] is None
+                else ManifestPermissions.model_validate_json(str(row["permissions_json"]))
+            ),
         )
 
     # --- plugin KV ------------------------------------------------------------

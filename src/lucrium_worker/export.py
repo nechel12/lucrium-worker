@@ -45,6 +45,7 @@ from lucrium_protocol import (
     PluginSource,
     to_wire,
 )
+from lucrium_protocol.manifest import ManifestPermissions
 from pydantic import ValidationError
 
 from .plugins.installer import InstallError, PluginInstaller
@@ -360,6 +361,7 @@ def _plugin_payload(plugin: PluginRecord, data: dict[str, Any]) -> dict[str, Any
         "config": plugin.config,
         "installed_at": plugin.installed_at.isoformat(),
         "updated_at": plugin.updated_at.isoformat(),
+        "permissions": None if plugin.permissions is None else plugin.permissions.model_dump(mode="json"),
         "data": data,
     }
 
@@ -424,6 +426,7 @@ def _parse_plugin(item: Any) -> tuple[PluginRecord, dict[str, Any]]:
         data = item.get("data") or {}
         if not isinstance(data, dict):
             raise ExportError("plugin.data must be an object")
+        permissions = item.get("permissions")
         record = PluginRecord(
             id=plugin_id,
             name=name,
@@ -434,6 +437,7 @@ def _parse_plugin(item: Any) -> tuple[PluginRecord, dict[str, Any]]:
             config=dict(config),
             installed_at=_aware_datetime(item["installed_at"], "plugin.installed_at"),
             updated_at=_aware_datetime(item["updated_at"], "plugin.updated_at"),
+            permissions=None if permissions is None else ManifestPermissions.model_validate(permissions),
         )
         return record, dict(data)
     except (KeyError, TypeError, ValueError) as exc:

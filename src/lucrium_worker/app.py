@@ -79,6 +79,7 @@ from lucrium_protocol import (
     build_response,
     decode_b64,
 )
+from lucrium_protocol.manifest import ManifestPermissions
 
 from . import __version__
 from .accounts import AccountError, AccountService
@@ -86,7 +87,7 @@ from .client_policy import is_panel_client_method
 from .config import WorkerConfig, ensure_directories
 from .export import ExportError, export_state, import_state, parse_state_dump
 from .logs import LogBuffer
-from .plugins.host import PluginHost
+from .plugins.host import PluginHost, permission_changes
 from .plugins.installer import InstallError, PluginInstaller
 from .sessions import SessionError, SessionManager
 from .storage import AccountRecord, PluginRecord, Storage
@@ -393,10 +394,18 @@ class WorkerApp:
         archive = decode_b64(payload.archive_b64, field="archive_b64")
         _verify_sha256(archive, payload.sha256)
         try:
+            incoming = self.installer.inspect(archive)
+            existing = await self.storage.get_plugin(incoming.id)
+            changes = _permission_delta(existing, incoming.permissions)
+            if changes and not payload.ack_permissions:
+                raise ProtocolError(
+                    ErrorCode.INVALID_PARAMS,
+                    f"installation changes permissions: {'; '.join(changes)}; "
+                    "repeat with ack_permissions=true after confirming",
+                )
             installed = self.installer.install(archive, overwrite=payload.overwrite)
         except InstallError as exc:
             raise ProtocolError(ErrorCode.INVALID_PARAMS, str(exc)) from exc
-        existing = await self.storage.get_plugin(installed.manifest.id)
         now = datetime.now(UTC)
         record = PluginRecord(
             id=installed.manifest.id,
@@ -408,6 +417,7 @@ class WorkerApp:
             config={} if existing is None else existing.config,
             installed_at=now if existing is None else existing.installed_at,
             updated_at=now,
+            permissions=installed.manifest.permissions,
         )
         await self.storage.upsert_plugin(record)
         if payload.auto_start and record.enabled:
@@ -445,6 +455,12 @@ class WorkerApp:
                 ErrorCode.INVALID_PARAMS,
                 f"archive contains {incoming.id!r}, expected {existing.id!r}",
             )
+        changes = _permission_delta(existing, incoming.permissions)
+        if changes and not payload.ack_permissions:
+            raise ProtocolError(
+                ErrorCode.INVALID_PARAMS,
+                f"update changes permissions: {'; '.join(changes)}; repeat with ack_permissions=true",
+            )
         try:
             self.installer.install(archive, overwrite=True)
         except InstallError as exc:
@@ -459,6 +475,7 @@ class WorkerApp:
             config=existing.config,
             installed_at=existing.installed_at,
             updated_at=datetime.now(UTC),
+            permissions=incoming.permissions,
         )
         await self.storage.upsert_plugin(record)
         was_running = self.plugins.status(record.id) in {
@@ -661,6 +678,7 @@ class WorkerApp:
             last_error=(self.plugins.last_error(record.id) or "")[:2000] or None,
             has_config_schema=has_schema,
             config=record.config if include_config else {},
+            permissions=record.permissions,
             installed_at=record.installed_at,
             updated_at=record.updated_at,
         )
@@ -875,6 +893,15 @@ def _verify_sha256(archive: bytes, expected: str | None) -> None:
     actual = hashlib.sha256(archive).hexdigest()
     if actual != expected.lower():
         raise ProtocolError(ErrorCode.INVALID_PARAMS, "archive sha256 mismatch")
+
+
+def _permission_delta(existing: PluginRecord | None, incoming: ManifestPermissions) -> list[str]:
+    """Отличия устанавливаемых разрешений от зафиксированных при прошлой установке."""
+    if existing is None:
+        return []
+    if existing.permissions is None:
+        return ["the installed record has no permission snapshot"]
+    return permission_changes(existing.permissions, incoming)
 
 
 __all__ = ["WorkerApp"]
