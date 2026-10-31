@@ -27,35 +27,73 @@ ALLOWED_CLIENT_ROOTS = frozenset(
 )
 
 FINANCIAL_ROOTS = frozenset({"finance", "transactions"})
-FINANCIAL_METHODS = frozenset({"orders.refund", "deals.cancel"})
+
+#: Движение денег и необратимые изменения аккаунта. Плагин получает их только при
+#: ``permissions.finance = true``; список собран по реальным методам aiosellers 0.3.2
+#: (paid-поднятие категории, приоритеты, создание/публикация/удаление лотов,
+#: движения по сделке, удаление отзыва).
+FINANCIAL_METHODS = frozenset(
+    {
+        "deals.cancel",
+        "deals.complete",
+        "deals.confirm",
+        "deals.create",
+        "games.accept_agreement",
+        "items.create",
+        "items.publish",
+        "items.remove",
+        "items.set_normal_priority",
+        "items.set_premium_priority",
+        "items.update",
+        "lots.delete",
+        "lots.hide_all",
+        "lots.raise_category",
+        "lots.save",
+        "lots.upload_offer_image",
+        "orders.delete_review",
+        "orders.refund",
+        "products.update_price",
+    }
+)
+
+#: Управление витриной из панели (спека §9: цена, вкл/выкл, удаление лота).
+#: Это собственное согласие владельца: оно не выдаётся плагину через ``finance``
+#: и не расширяется на платные и аккаунтовые операции.
+PANEL_LISTING_OPS = frozenset(
+    {
+        "items.publish",
+        "items.remove",
+        "items.update",
+        "lots.delete",
+        "products.update_price",
+    }
+)
 
 _PANEL_METHODS = frozenset(
     {
         "lots.calc",
         "lots.chip_fields",
-        "lots.delete",
         "lots.fields",
-        "lots.hide_all",
         "lots.list_self",
-        "lots.raise_category",
-        "lots.save",
-        "lots.upload_offer_image",
         "items.get",
         "items.list_self",
-        "items.publish",
-        "items.remove",
-        "items.update",
         "products.get",
         "products.list",
         "products.my",
-        "products.update_price",
     }
+    | PANEL_LISTING_OPS
 )
 """Только методы, которые реально нужны панели (лоты/товары)."""
 
 
-def is_financial_method(method: str) -> bool:
-    """True, если вызов двигает деньги/реквизиты и требует finance-opt-in."""
+def is_financial_method(method: str, *, panel: bool = False) -> bool:
+    """True, если вызов двигает деньги/меняет аккаунт необратимо.
+
+    ``panel=True`` снимает требование только для методов из панельного списка
+    витрины: вызовы из панели и так проходят через ``_PANEL_METHODS``.
+    """
+    if panel and method in _PANEL_METHODS:
+        return False
     return method.split(".", 1)[0] in FINANCIAL_ROOTS or method in FINANCIAL_METHODS
 
 
@@ -130,6 +168,7 @@ __all__ = [
     "FINANCIAL_METHODS",
     "FINANCIAL_ROOTS",
     "MEDIA_PARAMS",
+    "PANEL_LISTING_OPS",
     "is_financial_method",
     "is_panel_client_method",
     "unsafe_call_params",

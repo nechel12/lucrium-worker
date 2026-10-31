@@ -584,6 +584,7 @@ class WorkerApp:
                     payload.client_method,
                     payload.params,
                     allow_finance=False,
+                    panel=True,
                 ),
                 timeout=60,
             )

@@ -132,3 +132,47 @@ async def test_financial_methods_require_opt_in(manager: SessionManager) -> None
 
     assert await manager.call("acc-1", "finance.withdraw", {}, allow_finance=True) == {"withdrawn": True}
     assert await manager.call("acc-1", "orders.refund", {}, allow_finance=True) == {"refunded": True}
+
+
+async def test_paid_and_destructive_methods_require_finance(manager: SessionManager) -> None:
+    """Плагин без finance не тратит баланс и не сносит витрину."""
+    client = manager.resolve("acc-1").client
+    assert client is not None
+    client.lots = SimpleNamespace(
+        raise_category=lambda **_: {"raised": True},
+        hide_all=lambda **_: {"hidden": True},
+        delete=lambda **_: {"deleted": True},
+    )
+    client.items = SimpleNamespace(
+        publish=lambda **_: {"published": True},
+        set_premium_priority=lambda **_: {"premium": True},
+    )
+    client.games = SimpleNamespace(accept_agreement=lambda **_: {"accepted": True})
+
+    for method in (
+        "lots.raise_category",
+        "lots.hide_all",
+        "lots.delete",
+        "items.publish",
+        "items.set_premium_priority",
+        "games.accept_agreement",
+    ):
+        with pytest.raises(SessionError, match=r"permissions\.finance"):
+            await manager.call("acc-1", method, {})
+
+    assert await manager.call("acc-1", "lots.raise_category", {}, allow_finance=True) == {"raised": True}
+
+
+async def test_panel_listing_ops_do_not_need_finance(manager: SessionManager) -> None:
+    """Панель по §9 правит свои лоты, но платные операции ей не открываются."""
+    client = manager.resolve("acc-1").client
+    assert client is not None
+    client.items = SimpleNamespace(publish=lambda **_: {"ok": True}, update=lambda **_: {"ok": True})
+    client.products = SimpleNamespace(update_price=lambda **_: {"ok": True})
+    client.lots = SimpleNamespace(delete=lambda **_: {"ok": True}, raise_category=lambda **_: {"ok": True})
+
+    for method in ("items.publish", "items.update", "products.update_price", "lots.delete"):
+        assert await manager.call("acc-1", method, {}, panel=True) == {"ok": True}
+
+    with pytest.raises(SessionError, match=r"permissions\.finance"):
+        await manager.call("acc-1", "lots.raise_category", {}, panel=True)

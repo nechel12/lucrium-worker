@@ -78,6 +78,7 @@ class FakeSessions:
         params: dict[str, Any],
         *,
         allow_finance: bool = False,
+        panel: bool = False,
     ) -> Any:
         self.calls.append((session_id, method, params))
         return {"ok": True, "method": method}

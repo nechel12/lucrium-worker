@@ -143,12 +143,15 @@ class SessionManager:
         params: dict[str, Any],
         *,
         allow_finance: bool = False,
+        panel: bool = False,
     ) -> Any:
         """Вызов метода клиента aiosellers через dotted-путь (``chats.send_message``).
 
-        Финансовые методы (``finance.*``, ``transactions.*``, ``orders.refund``,
-        ``deals.cancel``) доступны только при ``allow_finance=True`` — это
-        разрешение выдаётся плагину манифестом, панель его не получает.
+        Финансовые и необратимые методы (``finance.*``, ``transactions.*``,
+        ``lots.raise_category``, ``deals.*``, удаление лотов) доступны только при
+        ``allow_finance=True`` — это разрешение выдаётся плагину манифестом.
+        ``panel=True`` — вызов из панели: её список витрины (§9) считается согласием
+        владельца и не открывает платные и аккаунтовые операции.
 
         Медианные параметры принимаются только как id загруженного файла или URL:
         строка-путь библиотека прочитала бы с диска воркера, то есть любой файл VPS
@@ -158,7 +161,7 @@ class SessionManager:
         root = parts[0]
         if root not in ALLOWED_CLIENT_ROOTS:
             raise SessionError(f"method {method!r} is not allowed")
-        if is_financial_method(method) and not allow_finance:
+        if is_financial_method(method, panel=panel) and not allow_finance:
             raise SessionError(f"method {method!r} requires permissions.finance = true")
         if any(part.startswith("_") or part in {"client", "transport", "raw"} for part in parts[1:]):
             raise SessionError(f"private client path {method!r} is not allowed")
