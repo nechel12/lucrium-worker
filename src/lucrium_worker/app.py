@@ -116,6 +116,10 @@ _LOCKED_COMMANDS: frozenset[str] = frozenset(
 
 class WorkerApp:
     def __init__(self, config: WorkerConfig, *, config_path: Path | None = None) -> None:
+        # aiosellers читает str-аргументы медиа-методов как файл. Пустое значение
+        # запрещает локальные пути вообще (второй слой поверх гейта в SessionManager);
+        # до AIOSELLERS_MEDIA_ROOTS в aiosellers переменная просто игнорируется.
+        os.environ.setdefault("AIOSELLERS_MEDIA_ROOTS", "")
         self.config = config
         self.config_path = config_path
         self.storage = Storage(config.database_path, config.secret_key_path)

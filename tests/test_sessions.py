@@ -91,6 +91,31 @@ async def test_non_callable_method_rejected(manager: SessionManager) -> None:
         await manager.call("acc-1", "chats.calls", {})
 
 
+async def test_media_params_reject_paths_on_worker_disk(manager: SessionManager) -> None:
+    """``image``/``photo`` как путь прочитал бы файл VPS и отправил его в чат."""
+    chats = manager.resolve("acc-1").client.chats  # type: ignore[attr-defined]
+    for params in (
+        {"chat_id": 1, "image": "/var/lib/lucrium/secret.key"},
+        {"chat_id": 1, "image": "worker.toml"},
+        {"chat_id": 1, "image": r"C:\Windows\system32\config\sam"},
+        {"chat_id": 1, "photo": "~/id_rsa"},
+        {"chat_id": 1, "attachments": [{"path": "/etc/passwd"}]},
+    ):
+        with pytest.raises(SessionError, match="uploaded-file id or an http"):
+            await manager.call("acc-1", "chats.send_message", params)
+    assert chats.calls == []
+
+
+async def test_media_params_accept_ids_and_urls(manager: SessionManager) -> None:
+    await manager.call("acc-1", "chats.send_message", {"chat_id": 1, "image": 77})
+    await manager.call("acc-1", "chats.send_message", {"chat_id": 1, "image": None})
+    await manager.call("acc-1", "chats.send_message", {"chat_id": 1, "image": "HTTPS://example.com/a.png"})
+    # текстовые параметры не режутся по форме значения: «/help» — легитимное сообщение
+    await manager.call("acc-1", "chats.send_message", {"chat_id": 1, "text": "/help /var/log"})
+    with pytest.raises(SessionError, match="NUL"):
+        await manager.call("acc-1", "chats.send_message", {"chat_id": 1, "text": "a\x00b"})
+
+
 async def test_financial_methods_require_opt_in(manager: SessionManager) -> None:
     client = manager.resolve("acc-1").client
     assert client is not None

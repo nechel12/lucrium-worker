@@ -30,7 +30,7 @@ from aiosellers import (
 )
 from lucrium_protocol import HubEvent, LogLevel, Platform, SessionStatus
 
-from .client_policy import ALLOWED_CLIENT_ROOTS, is_financial_method
+from .client_policy import ALLOWED_CLIENT_ROOTS, is_financial_method, unsafe_call_params
 from .logs import LogBuffer
 from .serialization import hub_event_to_protocol, to_jsonable
 from .storage import AccountRecord
@@ -149,6 +149,10 @@ class SessionManager:
         Финансовые методы (``finance.*``, ``transactions.*``, ``orders.refund``,
         ``deals.cancel``) доступны только при ``allow_finance=True`` — это
         разрешение выдаётся плагину манифестом, панель его не получает.
+
+        Медианные параметры принимаются только как id загруженного файла или URL:
+        строка-путь библиотека прочитала бы с диска воркера, то есть любой файл VPS
+        ушёл бы наружу через чат площадки (обходит и ``network``, и песочницу).
         """
         parts = method.split(".")
         root = parts[0]
@@ -158,6 +162,9 @@ class SessionManager:
             raise SessionError(f"method {method!r} requires permissions.finance = true")
         if any(part.startswith("_") or part in {"client", "transport", "raw"} for part in parts[1:]):
             raise SessionError(f"private client path {method!r} is not allowed")
+        reason = unsafe_call_params(params)
+        if reason is not None:
+            raise SessionError(reason)
         runtime = self.resolve(session_id)
         target: Any = runtime.client
         for part in parts:
