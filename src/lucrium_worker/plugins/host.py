@@ -14,6 +14,7 @@ import socket
 import struct
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -71,6 +72,7 @@ MAX_KV_VALUE_BYTES = 1024 * 1024
 EVENT_QUEUE_SIZE = 1000
 BACKOFF_START = 1.0
 BACKOFF_MAX = 60.0
+HEALTHY_AFTER = 300.0
 
 ErrorCallback = Callable[[PluginError], None]
 ChangeCallback = Callable[[], None]
@@ -247,6 +249,10 @@ class PluginHost:
         if plugin_id in self._restart_tasks or process.stopping:
             return
         process.last_error = error[:2000]
+        if process.running_since is not None and time.monotonic() - process.running_since >= HEALTHY_AFTER:
+            # плагин отработал пять минут стабильно: новая серия сбоев начинается сначала
+            process.restarts = 0
+            process.running_since = None
         process.restarts += 1
         delay = min(BACKOFF_START * (2 ** (process.restarts - 1)), BACKOFF_MAX)
         if self._on_error is not None:
@@ -301,6 +307,7 @@ class _PluginProcess:
         self.host = host
         self.status = PluginStatus.STOPPED
         self.restarts = 0
+        self.running_since: float | None = None
         self.last_error: str | None = None
         self.stopping = False
         self._process: asyncio.subprocess.Process | None = None
@@ -386,6 +393,7 @@ class _PluginProcess:
             await self.cleanup()
             raise RuntimeError(self.last_error) from exc
         self.status = PluginStatus.RUNNING
+        self.running_since = time.monotonic()
         self._tasks.append(asyncio.create_task(self._event_worker(), name=f"plugin-events-{self.record.id}"))
         self.host._logs.add(LogLevel.INFO, self.record.id, "plugin started", {"version": self.record.version})
 

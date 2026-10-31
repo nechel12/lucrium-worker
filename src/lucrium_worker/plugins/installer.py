@@ -27,6 +27,7 @@ _PLUGIN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{2,63}$")
 MAX_ARCHIVE_BYTES = 48 * 1024 * 1024
 MAX_UNCOMPRESSED_BYTES = 128 * 1024 * 1024
 MAX_FILES = 2000
+_COPY_CHUNK_BYTES = 64 * 1024
 
 
 class InstallError(Exception):
@@ -117,6 +118,7 @@ class PluginInstaller:
         staging: Path,
     ) -> None:
         staging.mkdir(parents=True, exist_ok=False)
+        extracted = 0
         for info in members:
             relative = _relative_name(info, root)
             if relative is None:
@@ -127,7 +129,13 @@ class PluginInstaller:
                 continue
             destination.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(info) as src, destination.open("wb") as dst:
-                shutil.copyfileobj(src, dst)
+                # считаем фактические байты: file_size в центральном каталоге
+                # пишет тот, кто собрал архив, и может честно врать
+                while chunk := src.read(_COPY_CHUNK_BYTES):
+                    extracted += len(chunk)
+                    if extracted > MAX_UNCOMPRESSED_BYTES:
+                        raise InstallError(f"archive unpacks beyond {MAX_UNCOMPRESSED_BYTES} bytes")
+                    dst.write(chunk)
 
 
 def _safe_members(zf: zipfile.ZipFile) -> list[zipfile.ZipInfo]:

@@ -247,7 +247,9 @@ class SessionManager:
             running_since: float | None = None
             stream: AsyncIterator[Any] | None = None
             try:
-                state = SQLiteStateStore(self._data_dir / "sessions" / f"{record.id}.db")
+                # конструктор поднимает sqlite3-соединение и делает CREATE TABLE
+                # синхронно — уводим из event loop
+                state = await asyncio.to_thread(SQLiteStateStore, self._data_dir / "sessions" / f"{record.id}.db")
                 runtime.state_store = state
                 runtime.status = SessionStatus.STARTING
                 self._notify_change()

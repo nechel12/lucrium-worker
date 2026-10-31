@@ -463,8 +463,14 @@ class Storage:
             await self._commit()
         return int(cursor.lastrowid or 0)
 
-    async def list_all_events(self) -> list[HubEvent]:
-        cursor = await self.db.execute("SELECT payload_json FROM events ORDER BY id")
+    async def list_all_events(self, *, limit: int | None = None) -> list[HubEvent]:
+        """Все события в хронологическом порядке; ``limit`` — потолок выборки."""
+        sql = "SELECT payload_json FROM events ORDER BY id"
+        args: tuple[Any, ...] = ()
+        if limit is not None:
+            sql += " LIMIT ?"
+            args = (limit,)
+        cursor = await self.db.execute(sql, args)
         return [HubEvent.model_validate_json(row["payload_json"]) for row in await cursor.fetchall()]
 
     async def list_events(

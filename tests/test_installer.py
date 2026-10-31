@@ -91,3 +91,22 @@ def test_remove(tmp_path: Path) -> None:
     installer.remove(installed.manifest.id)
     assert not installed.directory.exists()
     installer.remove("missing")  # no-op
+
+
+def test_extract_counts_real_bytes_not_the_header_lie(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Потолок распаковки считается по фактическим байтам, а не по file_size."""
+    import io
+    import zipfile
+
+    from lucrium_worker.plugins import installer as installer_module
+
+    monkeypatch.setattr(installer_module, "MAX_UNCOMPRESSED_BYTES", 4096)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("plugin.toml", PLUGIN_TOML)
+        archive.writestr("plugin_main.py", "x" * 200_000)
+    with zipfile.ZipFile(io.BytesIO(buffer.getvalue())) as zf:
+        members = zf.infolist()
+        staging = tmp_path / "staging"
+        with pytest.raises(InstallError, match="unpacks beyond"):
+            PluginInstaller._extract(zf, members, "", staging)

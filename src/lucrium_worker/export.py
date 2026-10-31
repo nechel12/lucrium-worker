@@ -100,11 +100,15 @@ async def export_state(
             directory = plugins_dir / plugin.id
             if not directory.is_dir():
                 continue
-            archive = _zip_plugin_dir(directory)
+            # упаковка до 128 МиБ на плагин — в event loop она вешает heartbeat
+            # и приём событий всех площадок
+            archive = await asyncio.to_thread(_zip_plugin_dir, directory)
             if archive:
                 artifacts[plugin.id] = base64.b64encode(archive).decode()
 
-    events = await storage.list_all_events() if include_history else []
+    events = await storage.list_all_events(limit=MAX_EVENTS + 1) if include_history else []
+    if len(events) > MAX_EVENTS:
+        raise ExportError(f"history is larger than {MAX_EVENTS} events; export without history")
     payload: dict[str, Any] = {
         "format": FORMAT_VERSION,
         "exported_at": datetime.now(UTC).isoformat(),

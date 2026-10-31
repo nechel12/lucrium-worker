@@ -174,8 +174,15 @@ class WorkerConfig:
                 f'certfile = "{self.tls.certfile.as_posix()}"',
                 f'keyfile = "{self.tls.keyfile.as_posix()}"',
             ]
-        temp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        _chmod_600(temp)
+        # файл конфига содержит pairing-токен: создаём сразу с 0600, а не
+        # «пишем при 0644 и потом chmod» (между этими двумя шагами токен читаем)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temp)
+        with os.fdopen(
+            os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600),
+            "wb",
+        ) as handle:
+            handle.write(("\n".join(lines) + "\n").encode("utf-8"))
         os.replace(temp, file)
         _chmod_600(file)
         return file
