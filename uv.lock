@@ -8,7 +8,7 @@ resolution-markers = [
 
 [[package]]
 name = "aiosellers-nechel12"
-version = "0.3.2"
+version = "0.3.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beautifulsoup4" },
@@ -18,9 +18,9 @@ dependencies = [
     { name = "websockets" },
     { name = "wrapper-tls-requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/93/25/29289bad3d1869c7774de5580c55a6a13df7130f30618e777f4817b0fa7b/aiosellers_nechel12-0.3.2.tar.gz", hash = "sha256:9b7d4533260946f9896b87d3ee2010c29177924ac1321cfc119c45061d8fe446", size = 249030, upload-time = "2026-10-30T13:05:35.118Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/85/44/0bf7352a8ae952a2b8f522588547954add93aaaf3eb491788412aa6b9615/aiosellers_nechel12-0.3.4.tar.gz", hash = "sha256:4008501032f3a87de330f2aed0985503fd638d674b646e633f6e225f70224cb8", size = 253378, upload-time = "2026-10-31T08:35:19.656Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/02/0b/7e04bd76865ca5ce74e383110f2d78a928ef99745fffb47dd77806982007/aiosellers_nechel12-0.3.2-py3-none-any.whl", hash = "sha256:760ba1356cffe98590920b2e41422afc9b61eec6646004424ecdc844fd48e27a", size = 187738, upload-time = "2026-10-30T13:05:33.479Z" },
+    { url = "https://files.pythonhosted.org/packages/75/91/0b6497aa1c67bf8219f001a6df160324756f7427229f9d14a4fa253c9c12/aiosellers_nechel12-0.3.4-py3-none-any.whl", hash = "sha256:9fcd567ce9a8f1fa0f9ab886341ef072a9df94f262861c9c1807d9d7fcda711a", size = 189584, upload-time = "2026-10-31T08:35:17.853Z" },
 ]
 
 [[package]]
@@ -612,7 +612,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aiosellers-nechel12", specifier = "==0.3.2" },
+    { name = "aiosellers-nechel12", specifier = "==0.3.4" },
     { name = "aiosqlite", specifier = ">=0.20" },
     { name = "cryptography", specifier = ">=43" },
     { name = "jsonschema", specifier = ">=4.23" },
